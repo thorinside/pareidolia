@@ -14,13 +14,17 @@
 // Constants
 // ============================================================================
 
-static const float kSampleRate = 48000.0f;
-static const float kInvSampleRate = 1.0f / 48000.0f;
+// Sample rate is read from NT_globals at construct time and stored on the
+// algorithm struct.  These file-scope pointers are set once in construct()
+// so that helper structs (SVF, OnePole, DCBlocker) can reference them
+// without needing the algorithm pointer.
+static float gSampleRate = 48000.0f;
+static float gInvSampleRate = 1.0f / 48000.0f;
 static const float kTwoPi = 6.2831853071795864f;
 static const float kPi = 3.1415926535897932f;
 
 static const int kMaxGrains = 24;
-static const int kMaxGrainSamples = 48000;  // 1000ms at 48kHz
+static const float kMaxGrainMs = 2000.0f;  // max grain duration in ms
 static const int kHannLUTSize = 4800;
 static const int kAnalysisBufferSize = 2048;
 static const int kCaptureBufferSize = 4096;
@@ -81,7 +85,7 @@ struct OnePole {
     }
 
     void setTimeConstant(float timeConstantMs) {
-        float controlRateHz = kSampleRate / (float)kControlRateDiv;
+        float controlRateHz = gSampleRate / (float)kControlRateDiv;
         float timeConstantSec = timeConstantMs * 0.001f;
         coeff = 1.0f - expf(-1.0f / (timeConstantSec * controlRateHz));
     }
@@ -109,7 +113,7 @@ struct SVF {
     }
 
     void setFreqQ(float freqHz, float Q) {
-        g = tanf(kPi * freqHz * kInvSampleRate);
+        g = tanf(kPi * freqHz * gInvSampleRate);
         k = 1.0f / Q;
         a1 = 1.0f / (1.0f + g * (g + k));
         a2 = g * a1;
@@ -180,7 +184,7 @@ struct DCBlocker {
 
     void init(float cutoffHz) {
         x1 = y1 = 0.0f;
-        coeff = 1.0f - (kTwoPi * cutoffHz * kInvSampleRate);
+        coeff = 1.0f - (kTwoPi * cutoffHz * gInvSampleRate);
     }
 
     float process(float x) {
@@ -381,7 +385,7 @@ struct _pareidoliaAlgorithm : public _NT_algorithm {
     // Analysis output smoothers (prevent clicks from stepped analysis updates)
     OnePole smoothCentroid;
     OnePole smoothFlux;
-    OnePole smoothEnergy;
+
 
     // Smoothed parameter values (updated at control rate)
     float pDensity;
@@ -392,6 +396,15 @@ struct _pareidoliaAlgorithm : public _NT_algorithm {
     float pDryWet;
     float pCoherence;
     float pInputTracking;
+
+    // Clock input state
+    bool clockHigh;            // Schmitt trigger state
+    int clockBurstCount;       // total grains in this burst
+    int clockBurstFired;       // grains fired so far
+    int clockBurstElapsed;     // samples elapsed since trigger
+    int clockBurstDelays[4];   // sorted fire times (samples after trigger)
+    int clockPeriodSamples;    // measured period between rising edges (0 = invalid)
+    int clockSampleCounter;    // samples since last rising edge
 
     // CV inputs
     float formantCVVolts;   // V/Oct CV for formant center
@@ -429,6 +442,7 @@ enum {
     kParamInputTracking,
     kParamFormantCV,
     kParamPitchTrackEnable,
+    kParamClockCV,
     kNumParams,
 };
 
@@ -462,6 +476,7 @@ static const _NT_parameter parameters[] = {
     { .name = "Input Tracking", .min = 0, .max = 100, .def = 70, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
     NT_PARAMETER_CV_INPUT("Formant CV", 0, 0)
     { .name = "Pitch Track",   .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = onOffStrings },
+    NT_PARAMETER_CV_INPUT("Clock", 0, 0)
 };
 
 // Page definitions
@@ -474,7 +489,7 @@ static const uint8_t pageMain[] = {
 
 static const uint8_t pageRouting[] = {
     kParamInputL, kParamInputR, kParamOutputL, kParamOutputR,
-    kParamOutputMode, kParamFormantCV,
+    kParamOutputMode, kParamFormantCV, kParamClockCV,
 };
 
 static const _NT_parameterPage pages[] = {
@@ -569,8 +584,8 @@ static void yinFinalize(_pareidoliaAlgorithm* alg) {
     }
 
     // Step 3: Absolute threshold - find first dip below threshold
-    int minTau = (int)(kSampleRate / kMaxPitchHz);
-    int maxTau = (int)(kSampleRate / kMinPitchHz);
+    int minTau = (int)(gSampleRate / kMaxPitchHz);
+    int maxTau = (int)(gSampleRate / kMinPitchHz);
     if (minTau < 2) minTau = 2;
     if (maxTau >= W) maxTau = W - 1;
 
@@ -611,7 +626,7 @@ static void yinFinalize(_pareidoliaAlgorithm* alg) {
     }
 
     if (betterTau > 0.0f) {
-        alg->pitchEstimate = clampf(kSampleRate / betterTau, kMinPitchHz, kMaxPitchHz);
+        alg->pitchEstimate = clampf(gSampleRate / betterTau, kMinPitchHz, kMaxPitchHz);
     }
 
     alg->yinInProgress = false;
@@ -639,7 +654,7 @@ static void spectralFeaturesStep(_pareidoliaAlgorithm* alg) {
         // Goertzel for this band
         const float* buf = alg->yinSnapshot;
         const int N = kAnalysisBufferSize;
-        float freq = kBandCenters[b] * kInvSampleRate;
+        float freq = kBandCenters[b] * gInvSampleRate;
         float coeff = 2.0f * cosf(2.0f * kPi * freq);
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
         for (int i = 0; i < N; ++i) {
@@ -712,13 +727,13 @@ static bool fireGrain(_pareidoliaAlgorithm* alg, int channel) {
     g.f2Hz = alg->f2Final;
     g.f3Hz = alg->f3Final;
 
-    // Grain duration from Grain Length param (0%=10ms, 100%=1000ms).
+    // Grain duration from Grain Length param (0%=10ms, 100%=2000ms).
     // Cubic mapping keeps most of the knob travel in useful short/medium ranges.
     float lenShape = alg->pGrainLength * alg->pGrainLength * alg->pGrainLength;
-    float durMs = lerpf(10.0f, 1000.0f, lenShape);
-    g.duration = (int)(durMs * 0.001f * kSampleRate);
+    float durMs = lerpf(10.0f, 2000.0f, lenShape);
+    g.duration = (int)(durMs * 0.001f * gSampleRate);
     if (g.duration < 48) g.duration = 48;
-    if (g.duration > kMaxGrainSamples) g.duration = kMaxGrainSamples;
+    if (g.duration > (int)(kMaxGrainMs * 0.001f * gSampleRate)) g.duration = (int)(kMaxGrainMs * 0.001f * gSampleRate);
 
     // Grain Q from density
     g.grainQ = lerpf(5.0f, 15.0f, alg->effDensity);
@@ -762,9 +777,9 @@ static bool fireGrain(_pareidoliaAlgorithm* alg, int channel) {
             // Resonator benefits from slightly longer grains to read as
             // "whispered voice" rather than short noisy ticks.
             g.duration = (int)((float)g.duration * 1.75f);
-            int minResoDur = (int)(0.035f * kSampleRate);  // 35ms
+            int minResoDur = (int)(0.035f * gSampleRate);  // 35ms
             if (g.duration < minResoDur) g.duration = minResoDur;
-            if (g.duration > kMaxGrainSamples) g.duration = kMaxGrainSamples;
+            if (g.duration > (int)(kMaxGrainMs * 0.001f * gSampleRate)) g.duration = (int)(kMaxGrainMs * 0.001f * gSampleRate);
 
             // Mode C: impulse-excited resonator
             // Only reset filter state on mode change — allow natural ring-up
@@ -830,7 +845,7 @@ static float processGrainSample(_pareidoliaAlgorithm* alg, Grain& grain) {
         }
         case kGrainResonator: {
             // Generate impulse train
-            grain.impulsePhase += grain.impulseRate * kInvSampleRate;
+            grain.impulsePhase += grain.impulseRate * gInvSampleRate;
             float impulse = 0.0f;
             if (grain.impulsePhase >= 1.0f) {
                 grain.impulsePhase -= 1.0f;
@@ -862,25 +877,44 @@ static float processGrainSample(_pareidoliaAlgorithm* alg, Grain& grain) {
 }
 
 static void scheduleGrains(_pareidoliaAlgorithm* alg) {
+    // Clock-triggered burst grains (time-spread around trigger)
+    while (alg->clockBurstFired < alg->clockBurstCount &&
+           alg->clockBurstElapsed >= alg->clockBurstDelays[alg->clockBurstFired]) {
+        if (!fireGrain(alg, 0)) break;  // no free slots
+        if (alg->rng.nextFloat() < alg->pCoherence) {
+            fireGrain(alg, 1);  // paired R grain
+        }
+        alg->clockBurstFired++;
+    }
+    if (alg->clockBurstFired < alg->clockBurstCount) {
+        alg->clockBurstElapsed += kControlRateDiv;
+    }
+
     float density = alg->effDensity;
     if (density < 0.01f) density = 0.01f;
 
     float basePeriod;
     float jitterAmt;
 
-    float syncPitch = (alg->pitchConfidence >= 0.35f) ? alg->pitchEstimate : alg->heldPitchHz;
-    if (alg->pInputTracking > 0.1f && syncPitch > 60.0f) {
-        // Pitch-synchronous mode with held-pitch fallback when confidence dips.
-        basePeriod = kSampleRate / (syncPitch * density);
-        jitterAmt = 0.12f;
+    if (alg->clockPeriodSamples > 0) {
+        // Clock-synced mode: density selects power-of-2 subdivision
+        int subdivPow = (int)(density * 5.0f);  // 0..5
+        int subdivision = 1 << subdivPow;        // 1,2,4,8,16,32
+        basePeriod = (float)alg->clockPeriodSamples / (float)subdivision;
+        jitterAmt = 0.05f;
     } else {
-        // Free-running mode: 100Hz base × density
-        basePeriod = kSampleRate / (100.0f * density);
-        jitterAmt = 0.24f;
+        float syncPitch = (alg->pitchConfidence >= 0.35f) ? alg->pitchEstimate : alg->heldPitchHz;
+        if (alg->pInputTracking > 0.1f && syncPitch > 60.0f) {
+            basePeriod = gSampleRate / (syncPitch * density);
+            jitterAmt = 0.12f;
+        } else {
+            basePeriod = gSampleRate / (100.0f * density);
+            jitterAmt = 0.24f;
+        }
     }
 
     // Limit to reasonable range
-    basePeriod = clampf(basePeriod, 24.0f, kSampleRate);
+    basePeriod = clampf(basePeriod, 24.0f, gSampleRate);
 
     float coherence = alg->pCoherence;
 
@@ -954,7 +988,7 @@ static void updateFormantDrift(_pareidoliaAlgorithm* alg) {
 
     // LFO modulation (0.5-3Hz, depth scaled by drift)
     float lfoRate = lerpf(0.5f, 3.0f, drift);
-    float controlRateHz = kSampleRate / (float)kControlRateDiv;
+    float controlRateHz = gSampleRate / (float)kControlRateDiv;
     alg->lfoPhase += lfoRate / controlRateHz;
     if (alg->lfoPhase > 1.0f) alg->lfoPhase -= 1.0f;
 
@@ -1040,8 +1074,6 @@ static void updateControlRate(_pareidoliaAlgorithm* alg) {
     // Smooth analysis outputs to prevent stepped clicks
     float smoothedCentroid = alg->smoothCentroid.process(alg->spectralCentroid);
     float smoothedFlux = alg->smoothFlux.process(alg->spectralFlux);
-    float smoothedEnergy = alg->smoothEnergy.process(alg->inputEnergy);
-
     // 1. Formant center bias from spectral centroid + V/Oct CV
     float centroidOffset = clampf((smoothedCentroid - 1500.0f) / 3000.0f, -0.3f, 0.3f);
     alg->effFormantCenter = clampf(alg->pFormantCenter + centroidOffset * tracking + cvOffset, 0.0f, 1.0f);
@@ -1050,16 +1082,7 @@ static void updateControlRate(_pareidoliaAlgorithm* alg) {
     float fluxScale = lerpf(1.0f, lerpf(0.3f, 1.5f, smoothedFlux), tracking);
     alg->effDensity = clampf(alg->pDensity * fluxScale, 0.01f, 1.0f);
 
-    // 3. Energy gating of wet signal
-    float gateThreshold = 0.001f;
-    float energyGate;
-    if (smoothedEnergy > gateThreshold)
-        energyGate = 1.0f;
-    else if (gateThreshold > 0.0f)
-        energyGate = smoothedEnergy / gateThreshold;
-    else
-        energyGate = 0.0f;
-    alg->effDryWet = lerpf(alg->pDryWet, alg->pDryWet * energyGate, tracking);
+    alg->effDryWet = alg->pDryWet;
 
     // Update formant drift
     updateFormantDrift(alg);
@@ -1087,6 +1110,10 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     _pareidoliaAlgorithm* alg = new (ptrs.sram) _pareidoliaAlgorithm();
     alg->parameters = parameters;
     alg->parameterPages = &parameterPages;
+
+    // Read actual sample rate from hardware/emulator
+    gSampleRate = (float)NT_globals.sampleRate;
+    gInvSampleRate = 1.0f / gSampleRate;
 
 #if defined(__ARM_ARCH_7EM__)
     // Enable flush-to-zero and default-NaN to prevent denormal slowdown
@@ -1167,7 +1194,6 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     // Analysis output smoothers (longer time constants to avoid clicks)
     alg->smoothCentroid.init(1500.0f, 50.0f);
     alg->smoothFlux.init(0.0f, 30.0f);
-    alg->smoothEnergy.init(0.0f, 30.0f);
 
     // Set smoothed values to defaults
     alg->pDensity = 0.35f;
@@ -1178,6 +1204,14 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     alg->pDryWet = 0.55f;
     alg->pCoherence = 0.60f;
     alg->pInputTracking = 0.70f;
+
+    alg->clockHigh = false;
+    alg->clockBurstCount = 0;
+    alg->clockBurstFired = 0;
+    alg->clockBurstElapsed = 0;
+    memset(alg->clockBurstDelays, 0, sizeof(alg->clockBurstDelays));
+    alg->clockPeriodSamples = 0;
+    alg->clockSampleCounter = 0;
 
     alg->formantCVVolts = 0.0f;
     alg->effFormantCenter = 0.45f;
@@ -1238,6 +1272,57 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         alg->formantCVVolts = cvSum / (float)numFrames;
     } else {
         alg->formantCVVolts = 0.0f;
+    }
+
+    // Clock CV edge detection (per-sample Schmitt trigger)
+    int clockBus = alg->v[kParamClockCV] - 1;
+    if (clockBus < 0) {
+        alg->clockPeriodSamples = 0;
+    } else {
+        const float* clockIn = busFrames + clockBus * numFrames;
+        alg->clockSampleCounter += numFrames;
+        for (int i = 0; i < numFrames; ++i) {
+            float s = clockIn[i];
+            if (!alg->clockHigh && s > 2.5f) {
+                alg->clockHigh = true;
+                // Measure clock period (ignore very short intervals as debounce)
+                if (alg->clockSampleCounter > 480) {
+                    alg->clockPeriodSamples = alg->clockSampleCounter;
+                }
+                alg->clockSampleCounter = 0;
+                // Rising edge — schedule a burst with time-spread delays
+                int burstCount = 1 + (int)(alg->effDensity * 3.0f);
+                alg->clockBurstCount = burstCount;
+                alg->clockBurstFired = 0;
+                alg->clockBurstElapsed = 0;
+                // Spread window scales with grain length (10-80ms)
+                float spreadMs = lerpf(10.0f, 80.0f, alg->pGrainLength);
+                int spreadSamples = (int)(spreadMs * 0.001f * gSampleRate);
+                alg->clockBurstDelays[0] = 0;  // first grain fires immediately
+                for (int j = 1; j < burstCount; ++j) {
+                    // Product of two uniforms: skewed toward 0 (half-normal-ish)
+                    float r = alg->rng.nextFloat() * alg->rng.nextFloat();
+                    alg->clockBurstDelays[j] = (int)(r * (float)spreadSamples);
+                }
+                // Insertion sort (max 4 elements)
+                for (int j = 1; j < burstCount; ++j) {
+                    int key = alg->clockBurstDelays[j];
+                    int k = j - 1;
+                    while (k >= 0 && alg->clockBurstDelays[k] > key) {
+                        alg->clockBurstDelays[k + 1] = alg->clockBurstDelays[k];
+                        k--;
+                    }
+                    alg->clockBurstDelays[k + 1] = key;
+                }
+
+            } else if (alg->clockHigh && s < 0.5f) {
+                alg->clockHigh = false;
+            }
+        }
+        // Timeout: no edge for 2s → revert to free-running
+        if (alg->clockSampleCounter > (int)(gSampleRate * 2.0f)) {
+            alg->clockPeriodSamples = 0;
+        }
     }
 
     // YIN pitch tracking (expensive — gated by toggle)
