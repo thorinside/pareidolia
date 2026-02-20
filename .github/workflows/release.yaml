@@ -1,0 +1,50 @@
+name: Build and Release Pareidolia Plugin
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install ARM toolchain
+        run: |
+          brew update
+          brew install --cask gcc-arm-embedded
+
+      - name: Verify installation
+        run: arm-none-eabi-g++ --version
+
+      - name: Build plugin
+        run: |
+          make clean
+          make hardware
+
+      - name: Prepare release archive
+        run: |
+          mkdir -p release/programs/plug-ins/pareidolia
+          cp plugins/pareidolia.o release/programs/plug-ins/pareidolia/
+          cd release
+          zip -r ../pareidolia-plugin.zip programs
+          cd ..
+          echo "Archive contents:"
+          unzip -l pareidolia-plugin.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: pareidolia-plugin.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

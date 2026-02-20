@@ -8,7 +8,7 @@
 
 # Project configuration
 PROJECT = pareidolia
-NT_API_PATH = /Users/nealsanche/nosuch/nt_emu/external/distingNT_API
+NT_API_PATH ?= distingNT_API
 
 # Version from git
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "v1.0.0-dev")
