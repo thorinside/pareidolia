@@ -58,7 +58,7 @@ Create complete plugin structure with:
 - Stub `step()` that passes audio through with dry/wet mix
 - DSP utility implementations:
   - **SVF filter**: `setFreq()`, `processBandpass()`, `processHighShelf()`, `processAllpass()` - used everywhere
-  - **Hann window LUT**: Pre-computed at construction, 4800 entries (100ms max grain)
+  - **Hann window LUT**: Pre-computed at construction, 4800 entries (interpolated for up to 1000ms max grain)
   - **One-pole parameter smoother**: 7 instances, configurable time constant
   - **DC blocker**: Single-pole highpass at 15Hz
   - **Fractional delay line**: For ITD processing (64-sample max per band per channel)
@@ -74,7 +74,7 @@ Build on Phase 1 scaffold:
 - Overlap-add: accumulate active grains into output buffer
 - Formant Center parameter: maps 0-1 to frequency via `lerp(300, 3500, param)`
 - Grain Q: derived from density (5-15 range)
-- Grain duration: `lerp(100ms, 10ms, formant_center_param)` in samples
+- Grain duration: `lerp(1000ms, 10ms, formant_center_param)` in samples
 - Stereo: L/R channels fire grains independently (Coherence param controls correlation)
 - Verify: noise grains produce formant-shaped texture, density and formant center respond
 

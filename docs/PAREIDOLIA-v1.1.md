@@ -32,7 +32,7 @@ All processing must execute within a single stereo audio callback at 48 kHz. The
 |----|----|----|
 | **Resource** | **Budget** | **Notes** |
 | Max simultaneous grains | 24 | Pre-allocated grain pool, no dynamic alloc |
-| Grain buffer memory | ~230K samples | 24 grains × 4800 samples (100ms) × 2 ch |
+| Grain buffer memory | ~2.3M samples | 24 grains × 48000 samples (1000ms) × 2 ch |
 | Filterbank bands | 8 fixed bands | SVF or Butterworth, hard-tuned to formant regions |
 | FFT | None in audio path | Pitch detection via YIN; spectral analysis via filterbank |
 | Control rate | 64–256 samples | Parameter interpolation and grain scheduling |
@@ -179,7 +179,7 @@ Grains are scheduled from a pre-allocated pool of 24 grain slots. When all slots
 
 **Free-running mode** (pitch_confidence \< 0.5): Grain onset period derived from a fixed base rate (default: 100 Hz) scaled by grain_density_param. Larger jitter (±30%) for more organic texture.
 
-**Grain duration:** 10–100 ms. Shorter at higher formant center frequencies, longer at lower. Suggested mapping: duration_ms = lerp(100, 10, formant_center_param).
+**Grain duration:** 10–1000 ms. Shorter at higher formant center frequencies, longer at lower. Suggested mapping: duration_ms = lerp(1000, 10, formant_center_param).
 
 **Grain envelope:** Hann window (raised cosine). Ensures smooth amplitude transitions and COLA-compliant overlap-add. No other envelope shapes are needed for this application.
 
@@ -265,7 +265,7 @@ At low drift values, formants orbit a single vowel. At high drift, they transiti
 >
 > slot = acquire_grain_slot() // oldest slot if pool exhausted
 >
-> slot.duration = lerp(100ms, 10ms, formant_center_param)
+> slot.duration = lerp(1000ms, 10ms, formant_center_param)
 >
 > slot.envelope = precomputed_hann\[slot.duration\]
 >
@@ -569,7 +569,7 @@ Zero dynamic allocation in the audio callback. All buffers must be pre-allocated
 |----|----|----|
 | **Buffer** | **Size** | **Purpose** |
 | Grain pool | 24 × grain_struct | Pre-allocated grain slot array (content buffer, envelope pointer, position, state) |
-| Grain content buffers | 24 × 4800 samples | Max 100 ms grain at 48 kHz per slot |
+| Grain content buffers | 24 × 48000 samples | Max 1000 ms grain at 48 kHz per slot |
 | Input capture buffer | 4096 samples × 2 ch | Circular buffer for Mode B (input-seeded grains) |
 | Analysis buffer | 2048 samples | YIN pitch detection input |
 | Filterbank state | 8 bands × 2 ch × SVF state | Per-band filter state variables |
@@ -625,7 +625,7 @@ When a continuous parameter (Formant Center, Grain Density, Drift) changes while
 
 **Grain Source Mode Switching:**
 
-When switching between Modes A/B/C, do NOT kill active grains. Allow all currently sounding grains to complete their envelopes naturally. New grains after the switch use the new mode. This produces a smooth crossfade between modes over the span of one grain cycle (~10–100 ms). Additionally, when switching TO Mode C (resonator), reset the SVF filter states for newly allocated grains to prevent state carry-over from previous grain content.
+When switching between Modes A/B/C, do NOT kill active grains. Allow all currently sounding grains to complete their envelopes naturally. New grains after the switch use the new mode. This produces a smooth crossfade between modes over the span of one grain cycle (~10–1000 ms). Additionally, when switching TO Mode C (resonator), reset the SVF filter states for newly allocated grains to prevent state carry-over from previous grain content.
 
 **Silent Input:**
 
