@@ -1,0 +1,5 @@
+# Build artifacts
+plugins/*.dylib
+plugins/*.o
+plugins/*.so
+plugins/*.dll
