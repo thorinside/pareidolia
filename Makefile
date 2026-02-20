@@ -34,11 +34,8 @@ CXXFLAGS_ARM = $(CXXFLAGS_COMMON) $(DEFINES_HARDWARE) \
 	-mfpu=fpv5-d16 \
 	-mfloat-abi=hard \
 	-mthumb \
-	-O3 \
-	-ffast-math \
-	-funroll-loops \
-	-fdata-sections \
-	-ffunction-sections
+	-Os \
+	-fPIC
 
 # Desktop test build
 UNAME_S := $(shell uname -s)

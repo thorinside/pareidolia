@@ -14,12 +14,12 @@
 // Constants
 // ============================================================================
 
-// Sample rate is read from NT_globals at construct time and stored on the
-// algorithm struct.  These file-scope pointers are set once in construct()
-// so that helper structs (SVF, OnePole, DCBlocker) can reference them
-// without needing the algorithm pointer.
-static float gSampleRate = 48000.0f;
-static float gInvSampleRate = 1.0f / 48000.0f;
+// Sample rate — set from NT_globals in construct() and refreshed in step().
+// File-scope so helper structs (SVF, OnePole, DCBlocker) can reference them.
+// NOT initialised here because the NT plugin loader may not handle .data;
+// construct() and step() always write these before first use.
+static float gSampleRate;
+static float gInvSampleRate;
 static const float kTwoPi = 6.2831853071795864f;
 static const float kPi = 3.1415926535897932f;
 
@@ -1250,6 +1250,9 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     _pareidolia_DTC* dtc = alg->dtc;
 
     int numFrames = numFramesBy4 * 4;
+
+    gSampleRate = (float)NT_globals.sampleRate;
+    gInvSampleRate = 1.0f / gSampleRate;
 
     // Get bus pointers
     int inBusL  = alg->v[kParamInputL] - 1;
