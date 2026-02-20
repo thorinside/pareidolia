@@ -25,9 +25,7 @@ static const int kHannLUTSize = 4800;
 static const int kAnalysisBufferSize = 2048;
 static const int kCaptureBufferSize = 4096;
 static const int kControlRateDiv = 64;     // control rate every 64 samples
-static const int kNumFilterBands = 5;
-static const int kDelayLineSize = 64;
-
+static const int kNumAnalysisBands = 5;
 // YIN constants
 static const int kYinBufferSize = 2048;
 static const float kYinThreshold = 0.15f;
@@ -174,27 +172,6 @@ struct SVF {
 };
 
 // High-shelf filter using SVF
-struct HighShelf {
-    SVF svf;
-    float gainLin;
-
-    void reset() { svf.reset(); }
-
-    void set(float freqHz, float Q, float gainDb) {
-        svf.setFreqQ(freqHz, Q);
-        gainLin = powf(10.0f, gainDb / 20.0f);
-        sqrtGainLin = sqrtf(gainLin);
-    }
-
-    float process(float v0) {
-        float lp, bp, hp;
-        svf.processAll(v0, lp, bp, hp);
-        return lp + bp * sqrtGainLin + hp * gainLin;
-    }
-
-    float sqrtGainLin;
-};
-
 // DC blocker - single-pole highpass
 struct DCBlocker {
     float x1;
@@ -210,34 +187,6 @@ struct DCBlocker {
         y1 = x - x1 + coeff * y1;
         x1 = x;
         return y1;
-    }
-};
-
-// Fractional delay line (linear interpolation)
-struct FracDelayLine {
-    float buffer[kDelayLineSize];
-    int writeIdx;
-
-    void reset() {
-        for (int i = 0; i < kDelayLineSize; ++i) buffer[i] = 0.0f;
-        writeIdx = 0;
-    }
-
-    void write(float sample) {
-        buffer[writeIdx] = sample;
-        writeIdx = (writeIdx + 1) & (kDelayLineSize - 1);
-    }
-
-    float read(float delaySamples) {
-        if (delaySamples < 0.0f) delaySamples = 0.0f;
-        if (delaySamples > (float)(kDelayLineSize - 2))
-            delaySamples = (float)(kDelayLineSize - 2);
-
-        int idx0 = writeIdx - 1 - (int)delaySamples;
-        float frac = delaySamples - (int)delaySamples;
-        idx0 &= (kDelayLineSize - 1);
-        int idx1 = (idx0 - 1) & (kDelayLineSize - 1);
-        return buffer[idx0] + frac * (buffer[idx1] - buffer[idx0]);
     }
 };
 
@@ -325,24 +274,13 @@ static const VowelTarget kVowelTargets[5] = {
     { 300.0f,  900.0f },   // /u/ "who"
 };
 
-// ============================================================================
-// Filterbank band definitions
-// ============================================================================
-
-struct BandDef {
-    float lo;
-    float hi;
-    float center;
-    float maxITD;     // max ITD in samples for this band
-    float ildIntensity;
-};
-
-static const BandDef kBands[kNumFilterBands] = {
-    {   80.0f,   400.0f,   200.0f, 24.0f, 0.3f },  // F1 region
-    {  400.0f,  1200.0f,   800.0f, 16.0f, 0.6f },  // F1 upper / F2 lower
-    { 1200.0f,  2500.0f,  1800.0f, 10.0f, 0.8f },  // F2 region (primary voice)
-    { 2500.0f,  5000.0f,  3750.0f,  6.0f, 0.9f },  // F3 / presence / pinna
-    { 5000.0f, 12000.0f,  8000.0f,  3.0f, 0.7f },  // Air / spatial cues
+// Band center frequencies for spectral analysis
+static const float kBandCenters[kNumAnalysisBands] = {
+    200.0f,   // F1 region
+    800.0f,   // F1 upper / F2 lower
+    1800.0f,  // F2 region (primary voice)
+    3750.0f,  // F3 / presence
+    8000.0f,  // Air / spatial cues
 };
 
 // ============================================================================
@@ -350,10 +288,6 @@ static const BandDef kBands[kNumFilterBands] = {
 // ============================================================================
 
 struct _pareidolia_DTC {
-    // Filterbank SVFs: 5 bands × 2 channels (lowpass + highpass pair per band)
-    SVF bandLP[kNumFilterBands][2];
-    SVF bandHP[kNumFilterBands][2];
-
     // DC blockers (L/R)
     DCBlocker dcBlockL;
     DCBlocker dcBlockR;
@@ -363,19 +297,6 @@ struct _pareidolia_DTC {
 
     // Control-rate sample counter
     int controlCounter;
-
-    // Pinna simulation shelves
-    HighShelf pinnaL;
-    HighShelf pinnaR;
-
-    // Pinna R 8kHz peak/notch filter
-    SVF pinnaR8k;
-    float pinnaR8kGain;
-    float cachedPinnaAsymmetry;  // to avoid recomputing powf/sqrtf/tanf
-
-    // Allpass filters for phase offset (per band, per channel)
-    SVF allpassL[kNumFilterBands];
-    SVF allpassR[kNumFilterBands];
 };
 
 // ============================================================================
@@ -425,8 +346,8 @@ struct _pareidoliaAlgorithm : public _NT_algorithm {
     float spectralCentroid;    // Hz
     float spectralFlux;        // 0-1
     float inputEnergy;         // linear RMS
-    float prevBandEnergies[kNumFilterBands];
-    float curBandEnergies[kNumFilterBands];
+    float prevBandEnergies[kNumAnalysisBands];
+    float curBandEnergies[kNumAnalysisBands];
 
     // Vowel-space walk state
     int currentVowelTarget;
@@ -453,6 +374,10 @@ struct _pareidoliaAlgorithm : public _NT_algorithm {
     OnePole smoothCoherence;
     OnePole smoothInputTracking;
 
+    // Feature toggle smoother (click-free enable/disable of pitch tracking)
+    OnePole smoothPitchTrackEnable;
+    float pPitchTrackEnable;
+
     // Analysis output smoothers (prevent clicks from stepped analysis updates)
     OnePole smoothCentroid;
     OnePole smoothFlux;
@@ -476,9 +401,6 @@ struct _pareidoliaAlgorithm : public _NT_algorithm {
     float effDensity;
     float effInputGain;
     float effDryWet;
-
-    // Per-band ITD delay lines
-    FracDelayLine delayLines[kNumFilterBands][2];
 
     // --- DRAM pointers ---
     // Input capture buffer for Mode B (4096 × 2ch)
@@ -506,6 +428,7 @@ enum {
     kParamCoherence,
     kParamInputTracking,
     kParamFormantCV,
+    kParamPitchTrackEnable,
     kNumParams,
 };
 
@@ -513,6 +436,12 @@ static const char* grainSourceStrings[] = {
     "Noise",
     "Input",
     "Resonator",
+    NULL,
+};
+
+static const char* onOffStrings[] = {
+    "Off",
+    "On",
     NULL,
 };
 
@@ -532,6 +461,7 @@ static const _NT_parameter parameters[] = {
     { .name = "Coherence",      .min = 0, .max = 100, .def = 60, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
     { .name = "Input Tracking", .min = 0, .max = 100, .def = 70, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
     NT_PARAMETER_CV_INPUT("Formant CV", 0, 0)
+    { .name = "Pitch Track",   .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = onOffStrings },
 };
 
 // Page definitions
@@ -539,6 +469,7 @@ static const uint8_t pageMain[] = {
     kParamGrainSource, kParamGrainDensity, kParamGrainLength,
     kParamFormantCenter, kParamFormantDrift,
     kParamInputAtten, kParamDryWetMix, kParamCoherence, kParamInputTracking,
+    kParamPitchTrackEnable,
 };
 
 static const uint8_t pageRouting[] = {
@@ -704,11 +635,11 @@ static void spectralFeaturesStep(_pareidoliaAlgorithm* alg) {
 
     int b = alg->spectralBandProgress;
 
-    if (b < kNumFilterBands) {
+    if (b < kNumAnalysisBands) {
         // Goertzel for this band
         const float* buf = alg->yinSnapshot;
         const int N = kAnalysisBufferSize;
-        float freq = kBands[b].center * kInvSampleRate;
+        float freq = kBandCenters[b] * kInvSampleRate;
         float coeff = 2.0f * cosf(2.0f * kPi * freq);
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
         for (int i = 0; i < N; ++i) {
@@ -719,7 +650,7 @@ static void spectralFeaturesStep(_pareidoliaAlgorithm* alg) {
         float energy = sqrtf((s1 * s1 + s2 * s2 - coeff * s1 * s2) / (float)(N * N));
         alg->curBandEnergies[b] = energy;
         alg->spectralTotalEnergy += energy;
-        alg->spectralWeightedFreq += energy * kBands[b].center;
+        alg->spectralWeightedFreq += energy * kBandCenters[b];
         alg->spectralBandProgress++;
     } else {
         // All bands done — finalize centroid, flux, energy
@@ -729,12 +660,12 @@ static void spectralFeaturesStep(_pareidoliaAlgorithm* alg) {
             alg->spectralCentroid = 1500.0f;
 
         float flux = 0.0f;
-        for (int i = 0; i < kNumFilterBands; ++i) {
+        for (int i = 0; i < kNumAnalysisBands; ++i) {
             float diff = alg->curBandEnergies[i] - alg->prevBandEnergies[i];
             flux += fabsf(diff);
             alg->prevBandEnergies[i] = alg->curBandEnergies[i];
         }
-        flux /= (float)kNumFilterBands;
+        flux /= (float)kNumAnalysisBands;
         alg->spectralFlux = clampf(flux * 20.0f, 0.0f, 1.0f);
 
         // RMS energy
@@ -1084,32 +1015,35 @@ static void updateControlRate(_pareidoliaAlgorithm* alg) {
     alg->pCoherence      = alg->smoothCoherence.process(rawCoherence);
     alg->pInputTracking  = alg->smoothInputTracking.process(rawTracking);
 
+    // Pitch tracking toggle smoother
+    alg->pPitchTrackEnable = alg->smoothPitchTrackEnable.process((float)alg->v[kParamPitchTrackEnable]);
+
     // Wet-engine input attenuation/drive.
     // Knob is squared for finer control in the upper range.
     float attenShape = alg->pInputAtten * alg->pInputAtten;
     alg->effInputGain = lerpf(0.08f, 1.0f, attenShape);
 
+    // Hold last valid pitch estimate (only when pitch tracking is active)
+    if (alg->pPitchTrackEnable > 0.01f) {
+        if (alg->pitchConfidence >= 0.45f) {
+            alg->heldPitchHz += (alg->pitchEstimate - alg->heldPitchHz) * 0.35f;
+        } else {
+            alg->heldPitchHz += (140.0f - alg->heldPitchHz) * 0.01f;
+        }
+        alg->heldPitchHz = clampf(alg->heldPitchHz, 80.0f, 320.0f);
+    }
+
     // Compute effective parameters with input tracking modulation
     float tracking = alg->pInputTracking;
+    float cvOffset = alg->formantCVVolts * (1.0f / 4.3f);
 
     // Smooth analysis outputs to prevent stepped clicks
     float smoothedCentroid = alg->smoothCentroid.process(alg->spectralCentroid);
     float smoothedFlux = alg->smoothFlux.process(alg->spectralFlux);
     float smoothedEnergy = alg->smoothEnergy.process(alg->inputEnergy);
 
-    // Hold last valid pitch estimate so grains stay musically anchored when
-    // confidence momentarily drops.
-    if (alg->pitchConfidence >= 0.45f) {
-        alg->heldPitchHz += (alg->pitchEstimate - alg->heldPitchHz) * 0.35f;
-    } else {
-        alg->heldPitchHz += (140.0f - alg->heldPitchHz) * 0.01f;
-    }
-    alg->heldPitchHz = clampf(alg->heldPitchHz, 80.0f, 320.0f);
-
     // 1. Formant center bias from spectral centroid + V/Oct CV
     float centroidOffset = clampf((smoothedCentroid - 1500.0f) / 3000.0f, -0.3f, 0.3f);
-    // V/Oct CV: ±5V range, each volt = ~1 octave across the formant range (~4.3 oct total)
-    float cvOffset = alg->formantCVVolts * (1.0f / 4.3f);
     alg->effFormantCenter = clampf(alg->pFormantCenter + centroidOffset * tracking + cvOffset, 0.0f, 1.0f);
 
     // 2. Grain density scaling from spectral flux
@@ -1117,7 +1051,7 @@ static void updateControlRate(_pareidoliaAlgorithm* alg) {
     alg->effDensity = clampf(alg->pDensity * fluxScale, 0.01f, 1.0f);
 
     // 3. Energy gating of wet signal
-    float gateThreshold = 0.001f;  // ~-60 dBFS
+    float gateThreshold = 0.001f;
     float energyGate;
     if (smoothedEnergy > gateThreshold)
         energyGate = 1.0f;
@@ -1133,7 +1067,6 @@ static void updateControlRate(_pareidoliaAlgorithm* alg) {
     // Schedule grains
     scheduleGrains(alg);
 
-    // Spatialization removed from DSP path.
 }
 
 // ============================================================================
@@ -1227,6 +1160,10 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     alg->smoothCoherence.init(0.60f, 15.0f);
     alg->smoothInputTracking.init(0.70f, 15.0f);
 
+    // Feature toggle smoother (50ms crossfade, default off)
+    alg->smoothPitchTrackEnable.init(0.0f, 50.0f);
+    alg->pPitchTrackEnable = 0.0f;
+
     // Analysis output smoothers (longer time constants to avoid clicks)
     alg->smoothCentroid.init(1500.0f, 50.0f);
     alg->smoothFlux.init(0.0f, 30.0f);
@@ -1251,44 +1188,13 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     // Initialize DTC data
     _pareidolia_DTC* dtc = alg->dtc;
 
-    // Initialize filterbank SVFs
-    for (int b = 0; b < kNumFilterBands; ++b) {
-        for (int ch = 0; ch < 2; ++ch) {
-            dtc->bandLP[b][ch].reset();
-            dtc->bandLP[b][ch].setFreqQ(kBands[b].hi, 0.707f);
-            dtc->bandHP[b][ch].reset();
-            dtc->bandHP[b][ch].setFreqQ(kBands[b].lo, 0.707f);
-        }
-        dtc->allpassL[b].reset();
-        dtc->allpassR[b].reset();
-        dtc->allpassL[b].setFreqQ(kBands[b].center, 0.7f);
-        dtc->allpassR[b].setFreqQ(kBands[b].center * 1.1f, 0.7f);
-    }
-
     // Initialize DC blockers
     dtc->dcBlockL.init(15.0f);
     dtc->dcBlockR.init(15.0f);
 
-    // Initialize frontal EQ (symmetric across channels).
-    dtc->pinnaL.reset();
-    dtc->pinnaL.set(3600.0f, 0.8f, 1.4f);
-    dtc->pinnaR.reset();
-    dtc->pinnaR.set(3600.0f, 0.8f, 1.4f);
-    dtc->pinnaR8k.reset();
-    dtc->pinnaR8k.setFreqQ(8000.0f, 2.0f);
-    dtc->pinnaR8kGain = 0.0f;
-    dtc->cachedPinnaAsymmetry = 1.0f;
-
     dtc->activeGrainCount = 0;
     dtc->controlCounter = 0;
 
-    // Initialize delay lines
-    for (int b = 0; b < kNumFilterBands; ++b) {
-        alg->delayLines[b][0].reset();
-        alg->delayLines[b][1].reset();
-    }
-
-    // Initialize allpass phases
     // Zero capture buffer
     memset(alg->captureBuffer, 0, kCaptureBufferSize * 2 * sizeof(float));
 
@@ -1334,19 +1240,33 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         alg->formantCVVolts = 0.0f;
     }
 
-    // Amortized analysis: start when buffer is full, progress each step
-    if (alg->analysisReady && !alg->yinInProgress) {
-        alg->analysisReady = false;
-        yinBegin(alg);
+    // YIN pitch tracking (expensive — gated by toggle)
+    if (alg->pPitchTrackEnable > 0.01f) {
+        if (alg->analysisReady && !alg->yinInProgress) {
+            alg->analysisReady = false;
+            yinBegin(alg);  // snapshots the buffer
+        }
+        if (alg->yinInProgress && !alg->yinDiffDone) {
+            yinStepIncremental(alg);
+        }
+        if (alg->yinDiffDone) {
+            yinFinalize(alg);
+            spectralFeaturesBegin(alg);
+        }
+    } else {
+        // Cancel any in-progress YIN
+        alg->yinInProgress = false;
+        alg->yinDiffDone = false;
+
+        // Spectral-only: snapshot buffer directly when ready
+        if (alg->analysisReady && !alg->spectralInProgress) {
+            alg->analysisReady = false;
+            memcpy(alg->yinSnapshot, alg->analysisBuffer, sizeof(alg->analysisBuffer));
+            spectralFeaturesBegin(alg);
+        }
     }
-    if (alg->yinInProgress && !alg->yinDiffDone) {
-        yinStepIncremental(alg);
-    }
-    if (alg->yinDiffDone) {
-        yinFinalize(alg);
-        spectralFeaturesBegin(alg);  // start amortized spectral computation
-    }
-    // Progress spectral features one band per step() call
+
+    // Goertzel spectral features (cheap, always on)
     if (alg->spectralInProgress) {
         spectralFeaturesStep(alg);
     }
@@ -1355,7 +1275,6 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     for (int i = 0; i < numFrames; ++i) {
         float wetInL = inL[i] * alg->effInputGain;
         float wetInR = inR[i] * alg->effInputGain;
-        // Mono-sum for analysis
         float mono = (wetInL + wetInR) * 0.5f;
         alg->analysisBuffer[alg->analysisWritePos] = mono;
         alg->analysisWritePos++;
@@ -1364,7 +1283,7 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             alg->analysisReady = true;
         }
 
-        // Capture buffer for Mode B (circular, interleaved L then R)
+        // Capture buffer for Mode B (always needed for input-seeded grains)
         alg->captureBuffer[alg->captureWritePos] = inL[i];
         alg->captureBuffer[kCaptureBufferSize + alg->captureWritePos] = inR[i];
         alg->captureWritePos = (alg->captureWritePos + 1) & (kCaptureBufferSize - 1);
