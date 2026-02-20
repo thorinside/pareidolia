@@ -1339,9 +1339,10 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             spectralFeaturesBegin(alg);
         }
     } else {
-        // Cancel any in-progress YIN
+        // Cancel any in-progress YIN and clear stale pitch state
         alg->yinInProgress = false;
         alg->yinDiffDone = false;
+        alg->pitchConfidence = 0.0f;
 
         // Spectral-only: snapshot buffer directly when ready
         if (alg->analysisReady && !alg->spectralInProgress) {
