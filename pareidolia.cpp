@@ -27,7 +27,7 @@ static const int kMaxGrains = 24;
 static const float kMaxGrainMs = 2000.0f;  // max grain duration in ms
 static const int kHannLUTSize = 4800;
 static const int kAnalysisBufferSize = 2048;
-static const int kCaptureBufferSize = 4096;
+static const int kCaptureBufferSize = 65536;
 static const int kControlRateDiv = 32;     // control rate every 32 samples
 static const int kNumAnalysisBands = 5;
 // YIN constants
@@ -39,6 +39,7 @@ static const int kYinTausPerStep = 4;   // amortize diff function across step ca
 static const float kResonatorModeBoost = 3.0f;
 static const float kOutputSoftCeilingVolts = 8.0f; // ~16Vpp soft ceiling
 static const float kGainSmoothingTimeSec = 0.005f; // 5ms smoothing
+static const float kMaxSpawnPeriodSec = 8.0f; // allow sparse, rhythmically slow grains
 
 // ============================================================================
 // DSP Utilities
@@ -765,9 +766,8 @@ static bool fireGrain(_pareidoliaAlgorithm* alg, int channel, int startDelaySamp
     g.f3Hz = alg->f3Final;
 
     // Grain duration from Grain Length param (0%=10ms, 100%=2000ms).
-    // Cubic mapping keeps most of the knob travel in useful short/medium ranges.
-    float lenShape = alg->pGrainLength * alg->pGrainLength * alg->pGrainLength;
-    float durMs = lerpf(10.0f, 2000.0f, lenShape);
+    // Use a linear mapping so mid/high knob positions produce clearly longer grains.
+    float durMs = lerpf(10.0f, 2000.0f, alg->pGrainLength);
     g.duration = (int)(durMs * 0.001f * gSampleRate);
     if (g.duration < 48) g.duration = 48;
     if (g.duration > (int)(kMaxGrainMs * 0.001f * gSampleRate)) g.duration = (int)(kMaxGrainMs * 0.001f * gSampleRate);
@@ -930,17 +930,26 @@ static void scheduleGrains(_pareidoliaAlgorithm* alg, int blockOffsetSamples) {
     uint32_t usedDelayMaskL = 0u;
     uint32_t usedDelayMaskR = 0u;
 
-    // Clock-triggered burst grains (time-spread around trigger)
-    while (alg->clockBurstFired < alg->clockBurstCount &&
-           alg->clockBurstElapsed >= alg->clockBurstDelays[alg->clockBurstFired]) {
-        if (!fireGrain(alg, 0, blockOffsetSamples)) break;  // no free slots
-        if (alg->rng.nextFloat() < alg->pCoherence) {
-            fireGrain(alg, 1, blockOffsetSamples);  // paired R grain
+    bool clocked = (alg->clockPeriodSamples > 0);
+
+    // Legacy edge-burst path is disabled while clocked; clock sync now relies
+    // on period-based scheduling so Grain Length remains perceptually useful.
+    if (!clocked) {
+        while (alg->clockBurstFired < alg->clockBurstCount &&
+               alg->clockBurstElapsed >= alg->clockBurstDelays[alg->clockBurstFired]) {
+            if (!fireGrain(alg, 0, blockOffsetSamples)) break;  // no free slots
+            if (alg->rng.nextFloat() < alg->pCoherence) {
+                fireGrain(alg, 1, blockOffsetSamples);  // paired R grain
+            }
+            alg->clockBurstFired++;
         }
-        alg->clockBurstFired++;
-    }
-    if (alg->clockBurstFired < alg->clockBurstCount) {
-        alg->clockBurstElapsed += kControlRateDiv;
+        if (alg->clockBurstFired < alg->clockBurstCount) {
+            alg->clockBurstElapsed += kControlRateDiv;
+        }
+    } else {
+        alg->clockBurstCount = 0;
+        alg->clockBurstFired = 0;
+        alg->clockBurstElapsed = 0;
     }
 
     float density = alg->effDensity;
@@ -949,12 +958,17 @@ static void scheduleGrains(_pareidoliaAlgorithm* alg, int blockOffsetSamples) {
     float basePeriod;
     float jitterAmt;
 
-    if (alg->clockPeriodSamples > 0) {
-        // Clock-synced mode: density selects power-of-2 subdivision
-        int subdivPow = (int)(density * 5.0f);  // 0..5
-        int subdivision = 1 << subdivPow;        // 1,2,4,8,16,32
-        basePeriod = (float)alg->clockPeriodSamples / (float)subdivision;
-        jitterAmt = 0.05f;
+    if (clocked) {
+        // Clock-synced mode:
+        // density selects rhythmic multiplier including slower-than-clock rates.
+        static const float kClockRateMult[8] = {
+            0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f
+        };
+        int rateIdx = (int)(density * 7.999f);  // 0..7
+        if (rateIdx < 0) rateIdx = 0;
+        if (rateIdx > 7) rateIdx = 7;
+        basePeriod = (float)alg->clockPeriodSamples / kClockRateMult[rateIdx];
+        jitterAmt = 0.0f;
     } else {
         float syncPitch = (alg->pitchConfidence >= 0.35f) ? alg->pitchEstimate : alg->heldPitchHz;
         if (alg->pInputTracking > 0.1f && syncPitch > 60.0f) {
@@ -967,7 +981,8 @@ static void scheduleGrains(_pareidoliaAlgorithm* alg, int blockOffsetSamples) {
     }
 
     // Limit to reasonable range
-    basePeriod = clampf(basePeriod, 24.0f, gSampleRate);
+    float maxPeriod = gSampleRate * kMaxSpawnPeriodSec;
+    basePeriod = clampf(basePeriod, 24.0f, maxPeriod);
 
     float coherence = alg->pCoherence;
 
@@ -987,7 +1002,7 @@ static void scheduleGrains(_pareidoliaAlgorithm* alg, int blockOffsetSamples) {
         lFiredCount++;
         alg->grainAccumL -= alg->nextGrainPeriodL;
         float jitter = alg->rng.nextRange(-jitterAmt, jitterAmt) * basePeriod;
-        alg->nextGrainPeriodL = clampf(basePeriod + jitter, 24.0f, gSampleRate);
+        alg->nextGrainPeriodL = clampf(basePeriod + jitter, 24.0f, maxPeriod);
     }
 
     // Paired R grains for coherence (one chance per L onset event).
@@ -998,7 +1013,7 @@ static void scheduleGrains(_pareidoliaAlgorithm* alg, int blockOffsetSamples) {
                 // Nudge R accumulator back to avoid immediate double-fire.
                 alg->grainAccumR *= 0.5f;
                 float jitter = alg->rng.nextRange(-jitterAmt, jitterAmt) * basePeriod;
-                alg->nextGrainPeriodR = clampf(basePeriod + jitter, 24.0f, gSampleRate);
+                alg->nextGrainPeriodR = clampf(basePeriod + jitter, 24.0f, maxPeriod);
             } else {
                 alg->grainAccumR = alg->nextGrainPeriodR - 1.0f;
                 break;
@@ -1015,7 +1030,7 @@ static void scheduleGrains(_pareidoliaAlgorithm* alg, int blockOffsetSamples) {
         }
         alg->grainAccumR -= alg->nextGrainPeriodR;
         float jitter = alg->rng.nextRange(-jitterAmt, jitterAmt) * basePeriod;
-        alg->nextGrainPeriodR = clampf(basePeriod + jitter, 24.0f, gSampleRate);
+        alg->nextGrainPeriodR = clampf(basePeriod + jitter, 24.0f, maxPeriod);
     }
 }
 
@@ -1236,23 +1251,23 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     alg->nextGrainPeriodL = 480.0f;
     alg->nextGrainPeriodR = 480.0f;
 
-    // Initialize parameter smoothers at default values
-    alg->smoothDensity.init(0.35f, 10.0f);
-    alg->smoothGrainLength.init(0.25f, 15.0f);
-    alg->smoothFormantCenter.init(0.45f, 20.0f);
-    alg->smoothFormantDrift.init(0.35f, 15.0f);
-    alg->smoothInputAtten.init(0.25f, 12.0f);
-    alg->smoothDryWet.init(0.55f, 10.0f);
-    alg->smoothCoherence.init(0.60f, 15.0f);
-    alg->smoothInputTracking.init(0.70f, 15.0f);
+    // Initialize parameter smoothers at default values (faster response).
+    alg->smoothDensity.init(0.35f, 6.0f);
+    alg->smoothGrainLength.init(0.25f, 8.0f);
+    alg->smoothFormantCenter.init(0.45f, 10.0f);
+    alg->smoothFormantDrift.init(0.35f, 9.0f);
+    alg->smoothInputAtten.init(0.25f, 7.0f);
+    alg->smoothDryWet.init(0.55f, 6.0f);
+    alg->smoothCoherence.init(0.60f, 9.0f);
+    alg->smoothInputTracking.init(0.70f, 9.0f);
 
-    // Feature toggle smoother (50ms crossfade, default off)
-    alg->smoothPitchTrackEnable.init(0.0f, 50.0f);
+    // Feature toggle smoother (30ms crossfade, default off)
+    alg->smoothPitchTrackEnable.init(0.0f, 30.0f);
     alg->pPitchTrackEnable = 0.0f;
 
-    // Analysis output smoothers (longer time constants to avoid clicks)
-    alg->smoothCentroid.init(1500.0f, 50.0f);
-    alg->smoothFlux.init(0.0f, 30.0f);
+    // Analysis output smoothers
+    alg->smoothCentroid.init(1500.0f, 35.0f);
+    alg->smoothFlux.init(0.0f, 20.0f);
 
     // Set smoothed values to defaults
     alg->pDensity = 0.35f;
@@ -1357,31 +1372,6 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
                     alg->clockPeriodSamples = alg->clockSampleCounter;
                 }
                 alg->clockSampleCounter = 0;
-                // Rising edge — schedule a burst with time-spread delays
-                int burstCount = 1 + (int)(alg->effDensity * 3.0f);
-                alg->clockBurstCount = burstCount;
-                alg->clockBurstFired = 0;
-                alg->clockBurstElapsed = 0;
-                // Spread window scales with grain length (10-80ms)
-                float spreadMs = lerpf(10.0f, 80.0f, alg->pGrainLength);
-                int spreadSamples = (int)(spreadMs * 0.001f * gSampleRate);
-                alg->clockBurstDelays[0] = 0;  // first grain fires immediately
-                for (int j = 1; j < burstCount; ++j) {
-                    // Product of two uniforms: skewed toward 0 (half-normal-ish)
-                    float r = alg->rng.nextFloat() * alg->rng.nextFloat();
-                    alg->clockBurstDelays[j] = (int)(r * (float)spreadSamples);
-                }
-                // Insertion sort (max 4 elements)
-                for (int j = 1; j < burstCount; ++j) {
-                    int key = alg->clockBurstDelays[j];
-                    int k = j - 1;
-                    while (k >= 0 && alg->clockBurstDelays[k] > key) {
-                        alg->clockBurstDelays[k + 1] = alg->clockBurstDelays[k];
-                        k--;
-                    }
-                    alg->clockBurstDelays[k + 1] = key;
-                }
-
             } else if (alg->clockHigh && s < 0.5f) {
                 alg->clockHigh = false;
             }
