@@ -1750,7 +1750,7 @@ static void setupUi(_NT_algorithm* self, _NT_float3& pots) {
 // ============================================================================
 
 static const _NT_factory factory = {
-    .guid = NT_MULTICHAR('N', 's', 'P', 'a'),
+    .guid = NT_MULTICHAR('T', 'h', 'P', 'a'),
     .name = "Pareidolia",
     .description = "Spectral voice hallucination - granular phantom choir effect",
     .numSpecifications = 0,
