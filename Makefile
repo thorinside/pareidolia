@@ -54,7 +54,7 @@ PLUGINS_DIR = plugins
 BUILD_DIR = build
 
 # Targets
-.PHONY: all hardware test clean size
+.PHONY: all hardware test push clean size
 
 all: hardware test
 
@@ -81,6 +81,10 @@ endif
 # Create output directory
 $(PLUGINS_DIR):
 	mkdir -p $(PLUGINS_DIR)
+
+# Push to disting NT via MIDI
+push: hardware
+	ntpush $(PLUGINS_DIR)/$(PROJECT).o
 
 # Clean build artifacts
 clean:

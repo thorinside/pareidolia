@@ -28,7 +28,7 @@ static const float kMaxGrainMs = 2000.0f;  // max grain duration in ms
 static const int kHannLUTSize = 4800;
 static const int kAnalysisBufferSize = 2048;
 static const int kCaptureBufferSize = 4096;
-static const int kControlRateDiv = 64;     // control rate every 64 samples
+static const int kControlRateDiv = 32;     // control rate every 32 samples
 static const int kNumAnalysisBands = 5;
 // YIN constants
 static const int kYinBufferSize = 2048;
@@ -36,8 +36,9 @@ static const float kYinThreshold = 0.15f;
 static const float kMinPitchHz = 50.0f;
 static const float kMaxPitchHz = 500.0f;
 static const int kYinTausPerStep = 4;   // amortize diff function across step calls
-static const float kResonatorModeBoost = 10.0f;
-static const float kOutputSoftCeilingVolts = 5.0f; // ~10Vpp soft ceiling
+static const float kResonatorModeBoost = 3.0f;
+static const float kOutputSoftCeilingVolts = 8.0f; // ~16Vpp soft ceiling
+static const float kGainSmoothingTimeSec = 0.005f; // 5ms smoothing
 
 // ============================================================================
 // DSP Utilities
@@ -87,7 +88,7 @@ struct OnePole {
     void setTimeConstant(float timeConstantMs) {
         float controlRateHz = gSampleRate / (float)kControlRateDiv;
         float timeConstantSec = timeConstantMs * 0.001f;
-        coeff = 1.0f - expf(-1.0f / (timeConstantSec * controlRateHz));
+        coeff = 1.0f - exp(-1.0f / (timeConstantSec * controlRateHz));
     }
 
     float process(float target) {
@@ -113,7 +114,7 @@ struct SVF {
     }
 
     void setFreqQ(float freqHz, float Q) {
-        g = tanf(kPi * freqHz * gInvSampleRate);
+        g = tan(kPi * freqHz * gInvSampleRate);
         k = 1.0f / Q;
         a1 = 1.0f / (1.0f + g * (g + k));
         a2 = g * a1;
@@ -229,6 +230,7 @@ enum GrainSourceMode {
 
 struct Grain {
     bool active;
+    int startDelay;     // samples to wait before grain starts outputting
     int position;       // current sample position within grain
     int duration;       // total grain duration in samples
     float hannPos;        // current LUT position
@@ -415,6 +417,11 @@ struct _pareidoliaAlgorithm : public _NT_algorithm {
     float effInputGain;
     float effDryWet;
 
+    // Audio-rate smoothed values to avoid clicks from control-rate jumps
+    float smoothedOverlapComp;
+    float smoothedInputGain;
+    float smoothedDryWet;
+
     // --- DRAM pointers ---
     // Input capture buffer for Mode B (4096 × 2ch)
     float* captureBuffer;    // [kCaptureBufferSize * 2] interleaved L/R
@@ -506,11 +513,12 @@ static const _NT_parameterPages parameterPages = {
 // Forward declarations
 // ============================================================================
 
-static void updateControlRate(_pareidoliaAlgorithm* alg);
+static void updateControlRate(_pareidoliaAlgorithm* alg, int blockOffsetSamples);
 static void updateFormantDrift(_pareidoliaAlgorithm* alg);
-static void scheduleGrains(_pareidoliaAlgorithm* alg);
-static bool fireGrain(_pareidoliaAlgorithm* alg, int channel);
+static void scheduleGrains(_pareidoliaAlgorithm* alg, int blockOffsetSamples);
+static bool fireGrain(_pareidoliaAlgorithm* alg, int channel, int startDelaySamples);
 static float processGrainSample(_pareidoliaAlgorithm* alg, Grain& grain);
+static int chooseSpawnDelay(_pareidoliaAlgorithm* alg, float basePeriod, uint32_t& usedMask);
 static void yinBegin(_pareidoliaAlgorithm* alg);
 static void yinStepIncremental(_pareidoliaAlgorithm* alg);
 static void yinFinalize(_pareidoliaAlgorithm* alg);
@@ -524,7 +532,7 @@ static void spectralFeaturesStep(_pareidoliaAlgorithm* alg);
 static void generateHannLUT(float* lut, int size) {
     for (int i = 0; i < size; ++i) {
         float phase = (float)i / (float)(size - 1);
-        lut[i] = 0.5f * (1.0f - cosf(kTwoPi * phase));
+        lut[i] = 0.5f * (1.0f - cos(kTwoPi * phase));
     }
 }
 
@@ -655,14 +663,14 @@ static void spectralFeaturesStep(_pareidoliaAlgorithm* alg) {
         const float* buf = alg->yinSnapshot;
         const int N = kAnalysisBufferSize;
         float freq = kBandCenters[b] * gInvSampleRate;
-        float coeff = 2.0f * cosf(2.0f * kPi * freq);
+        float coeff = 2.0f * cos(2.0f * kPi * freq);
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f;
         for (int i = 0; i < N; ++i) {
             s0 = buf[i] + coeff * s1 - s2;
             s2 = s1;
             s1 = s0;
         }
-        float energy = sqrtf((s1 * s1 + s2 * s2 - coeff * s1 * s2) / (float)(N * N));
+        float energy = sqrt((s1 * s1 + s2 * s2 - coeff * s1 * s2) / (float)(N * N));
         alg->curBandEnergies[b] = energy;
         alg->spectralTotalEnergy += energy;
         alg->spectralWeightedFreq += energy * kBandCenters[b];
@@ -677,7 +685,7 @@ static void spectralFeaturesStep(_pareidoliaAlgorithm* alg) {
         float flux = 0.0f;
         for (int i = 0; i < kNumAnalysisBands; ++i) {
             float diff = alg->curBandEnergies[i] - alg->prevBandEnergies[i];
-            flux += fabsf(diff);
+            flux += fabs(diff);
             alg->prevBandEnergies[i] = alg->curBandEnergies[i];
         }
         flux /= (float)kNumAnalysisBands;
@@ -690,7 +698,7 @@ static void spectralFeaturesStep(_pareidoliaAlgorithm* alg) {
         for (int i = 0; i < N; ++i) {
             rms += buf[i] * buf[i];
         }
-        alg->inputEnergy = sqrtf(rms / (float)N);
+        alg->inputEnergy = sqrt(rms / (float)N);
 
         alg->spectralInProgress = false;
     }
@@ -710,12 +718,39 @@ static int findFreeGrainSlot(_pareidoliaAlgorithm* alg) {
     return -1;
 }
 
-static bool fireGrain(_pareidoliaAlgorithm* alg, int channel) {
+// Choose a spawn delay within the current control block while avoiding
+// same-sample collisions for grains launched on the same channel/tick.
+static int chooseSpawnDelay(_pareidoliaAlgorithm* alg, float basePeriod, uint32_t& usedMask) {
+    if (basePeriod >= (float)(kControlRateDiv * 1.5f)) {
+        return 0;
+    }
+    if (usedMask == 0xFFFFFFFFu) {
+        return 0;
+    }
+
+    int start = (int)(alg->rng.nextFloat() * (float)kControlRateDiv);
+    if (start < 0) start = 0;
+    if (start >= kControlRateDiv) start = kControlRateDiv - 1;
+
+    for (int i = 0; i < kControlRateDiv; ++i) {
+        int idx = (start + i) % kControlRateDiv;
+        uint32_t bit = 1u << idx;
+        if ((usedMask & bit) == 0u) {
+            usedMask |= bit;
+            return idx;
+        }
+    }
+    return 0;
+}
+
+static bool fireGrain(_pareidoliaAlgorithm* alg, int channel, int startDelaySamples) {
     int slot = findFreeGrainSlot(alg);
     if (slot < 0) return false;
     Grain& g = alg->grains[slot];
 
     g.active = true;
+    if (startDelaySamples < 0) startDelaySamples = 0;
+    g.startDelay = startDelaySamples;
     g.position = 0;
     g.channel = channel;
 
@@ -751,7 +786,9 @@ static bool fireGrain(_pareidoliaAlgorithm* alg, int channel) {
             else
                 bpFreq = g.f3Hz;
             bpFreq *= alg->rng.nextRange(0.96f, 1.04f);
-            g.noiseBPF.reset();
+            if (g.prevMode != kGrainNoise) {
+                g.noiseBPF.reset();
+            }
             g.noiseBPF.setFreqQ(clampf(bpFreq, 180.0f, 4200.0f), g.grainQ * 1.15f);
             break;
         }
@@ -762,14 +799,26 @@ static bool fireGrain(_pareidoliaAlgorithm* alg, int channel) {
             // Clamp duration so grain doesn't wrap past capture buffer
             int maxDuration = (int)((float)kCaptureBufferSize / g.resampleRatio);
             if (g.duration > maxDuration) g.duration = maxDuration;
-            // Start from recent audio, offset randomly within the buffer
-            int readOffset = (int)(alg->rng.nextFloat() * (float)kCaptureBufferSize);
+            // Keep read head safely behind the live write head for the entire grain.
+            // This avoids ratio-dependent discontinuities when resampling faster than 1x.
+            float maxReadAdvance = (float)(g.duration - 1) * g.resampleRatio + 2.0f;
+            int minLag = (int)maxReadAdvance + 16;
+            int maxLag = kCaptureBufferSize - 2;
+            if (minLag < 2) minLag = 2;
+            if (minLag > maxLag) minLag = maxLag;
+            int lagRange = maxLag - minLag;
+            int readOffset = minLag;
+            if (lagRange > 0) {
+                readOffset += (int)(alg->rng.nextFloat() * (float)(lagRange + 1));
+            }
             g.captureReadPos = (alg->captureWritePos - readOffset + kCaptureBufferSize) & (kCaptureBufferSize - 1);
             // Bandpass tracks shifted pitch
             float bpFreq = (alg->pitchConfidence > 0.5f)
                 ? alg->pitchEstimate * g.resampleRatio
                 : lerpf(300.0f, 2000.0f, alg->effFormantCenter);
-            g.noiseBPF.reset();
+            if (g.prevMode != kGrainInputSeeded) {
+                g.noiseBPF.reset();
+            }
             g.noiseBPF.setFreqQ(clampf(bpFreq, 100.0f, 4000.0f), g.grainQ * 0.3f);
             break;
         }
@@ -870,19 +919,21 @@ static float processGrainSample(_pareidoliaAlgorithm* alg, Grain& grain) {
     if (lutIdx < 0) lutIdx = 0;
     float env = alg->hannLUT[lutIdx];
     sample *= env;
-    sample *= alg->effInputGain;
     grain.hannPos += grain.hannIncrement;
 
     return sample;
 }
 
-static void scheduleGrains(_pareidoliaAlgorithm* alg) {
+static void scheduleGrains(_pareidoliaAlgorithm* alg, int blockOffsetSamples) {
+    uint32_t usedDelayMaskL = 0u;
+    uint32_t usedDelayMaskR = 0u;
+
     // Clock-triggered burst grains (time-spread around trigger)
     while (alg->clockBurstFired < alg->clockBurstCount &&
            alg->clockBurstElapsed >= alg->clockBurstDelays[alg->clockBurstFired]) {
-        if (!fireGrain(alg, 0)) break;  // no free slots
+        if (!fireGrain(alg, 0, blockOffsetSamples)) break;  // no free slots
         if (alg->rng.nextFloat() < alg->pCoherence) {
-            fireGrain(alg, 1);  // paired R grain
+            fireGrain(alg, 1, blockOffsetSamples);  // paired R grain
         }
         alg->clockBurstFired++;
     }
@@ -918,45 +969,51 @@ static void scheduleGrains(_pareidoliaAlgorithm* alg) {
 
     float coherence = alg->pCoherence;
 
-    // Left channel scheduling
-    bool lFired = false;
+    // Advance accumulators once per control tick.
     alg->grainAccumL += (float)kControlRateDiv;
-    if (alg->grainAccumL >= alg->nextGrainPeriodL) {
-        if (fireGrain(alg, 0)) {
-            lFired = true;
-            alg->grainAccumL = 0.0f;
-            float jitter = alg->rng.nextRange(-jitterAmt, jitterAmt) * basePeriod;
-            alg->nextGrainPeriodL = basePeriod + jitter;
-        } else {
+    alg->grainAccumR += (float)kControlRateDiv;
+
+    // Left channel scheduling with carry-over timing (no hard reset to 0).
+    int lFiredCount = 0;
+    while (alg->grainAccumL >= alg->nextGrainPeriodL) {
+        int startDelay = chooseSpawnDelay(alg, basePeriod, usedDelayMaskL);
+        if (!fireGrain(alg, 0, blockOffsetSamples + startDelay)) {
             // Hold near threshold and retry on next control tick.
             alg->grainAccumL = alg->nextGrainPeriodL - 1.0f;
+            break;
+        }
+        lFiredCount++;
+        alg->grainAccumL -= alg->nextGrainPeriodL;
+        float jitter = alg->rng.nextRange(-jitterAmt, jitterAmt) * basePeriod;
+        alg->nextGrainPeriodL = clampf(basePeriod + jitter, 24.0f, gSampleRate);
+    }
+
+    // Paired R grains for coherence (one chance per L onset event).
+    for (int i = 0; i < lFiredCount; ++i) {
+        if (alg->rng.nextFloat() < coherence) {
+            int startDelay = chooseSpawnDelay(alg, basePeriod, usedDelayMaskR);
+            if (fireGrain(alg, 1, blockOffsetSamples + startDelay)) {
+                // Nudge R accumulator back to avoid immediate double-fire.
+                alg->grainAccumR *= 0.5f;
+                float jitter = alg->rng.nextRange(-jitterAmt, jitterAmt) * basePeriod;
+                alg->nextGrainPeriodR = clampf(basePeriod + jitter, 24.0f, gSampleRate);
+            } else {
+                alg->grainAccumR = alg->nextGrainPeriodR - 1.0f;
+                break;
+            }
         }
     }
 
-    // Right channel scheduling - two sources of R grains:
-    // 1) Paired: when L fires, with probability=coherence, also fire R
-    // 2) Independent: R runs its own schedule, gated by (1-coherence)
-    if (lFired && alg->rng.nextFloat() < coherence) {
-        if (fireGrain(alg, 1)) {
-            // Reset R accumulator so it doesn't double-fire right after
-            alg->grainAccumR = 0.0f;
-            float jitter = alg->rng.nextRange(-jitterAmt, jitterAmt) * basePeriod;
-            alg->nextGrainPeriodR = basePeriod + jitter;
-        } else {
+    // Independent R schedule with carry-over timing.
+    while (alg->grainAccumR >= alg->nextGrainPeriodR) {
+        int startDelay = chooseSpawnDelay(alg, basePeriod, usedDelayMaskR);
+        if (!fireGrain(alg, 1, blockOffsetSamples + startDelay)) {
             alg->grainAccumR = alg->nextGrainPeriodR - 1.0f;
+            break;
         }
-    } else {
-        // Independent R schedule
-        alg->grainAccumR += (float)kControlRateDiv;
-        if (alg->grainAccumR >= alg->nextGrainPeriodR) {
-            if (fireGrain(alg, 1)) {
-                alg->grainAccumR = 0.0f;
-                float jitter = alg->rng.nextRange(-jitterAmt, jitterAmt) * basePeriod;
-                alg->nextGrainPeriodR = basePeriod + jitter;
-            } else {
-                alg->grainAccumR = alg->nextGrainPeriodR - 1.0f;
-            }
-        }
+        alg->grainAccumR -= alg->nextGrainPeriodR;
+        float jitter = alg->rng.nextRange(-jitterAmt, jitterAmt) * basePeriod;
+        alg->nextGrainPeriodR = clampf(basePeriod + jitter, 24.0f, gSampleRate);
     }
 }
 
@@ -995,11 +1052,11 @@ static void updateFormantDrift(_pareidoliaAlgorithm* alg) {
     // Fast parabolic sine approximation (good enough for LFO)
     // Maps phase [0,1] to sine [-1,1]
     float p1 = alg->lfoPhase * 2.0f - 1.0f;  // [-1, 1]
-    float lfoSin = 4.0f * p1 * (1.0f - fabsf(p1));  // parabolic approx
+    float lfoSin = 4.0f * p1 * (1.0f - fabs(p1));  // parabolic approx
     float p2 = (alg->lfoPhase * 1.1f);
     p2 -= (int)p2;  // wrap to [0,1]
     p2 = p2 * 2.0f - 1.0f;
-    float lfoCos = 4.0f * p2 * (1.0f - fabsf(p2));
+    float lfoCos = 4.0f * p2 * (1.0f - fabs(p2));
     float lfoDepth = 80.0f * drift;
 
     // Bias formant targets based on Formant Center parameter
@@ -1024,7 +1081,7 @@ static void updateFormantDrift(_pareidoliaAlgorithm* alg) {
 // Control Rate Update
 // ============================================================================
 
-static void updateControlRate(_pareidoliaAlgorithm* alg) {
+static void updateControlRate(_pareidoliaAlgorithm* alg, int blockOffsetSamples) {
     // Smooth parameters
     float rawDensity       = (float)alg->v[kParamGrainDensity] / 100.0f;
     float rawGrainLength   = (float)alg->v[kParamGrainLength] / 100.0f;
@@ -1052,10 +1109,10 @@ static void updateControlRate(_pareidoliaAlgorithm* alg) {
     // Pitch tracking toggle smoother
     alg->pPitchTrackEnable = alg->smoothPitchTrackEnable.process((float)alg->v[kParamPitchTrackEnable]);
 
-    // Wet-engine input attenuation/drive.
-    // Knob is squared for finer control in the upper range.
+    // Input attenuation: 0% = unity, 100% = heavy attenuation.
+    // Knob is squared for finer low-attenuation control.
     float attenShape = alg->pInputAtten * alg->pInputAtten;
-    alg->effInputGain = lerpf(0.08f, 1.0f, attenShape);
+    alg->effInputGain = lerpf(1.0f, 0.10f, attenShape);
 
     // Hold last valid pitch estimate (only when pitch tracking is active)
     if (alg->pPitchTrackEnable > 0.01f) {
@@ -1088,7 +1145,7 @@ static void updateControlRate(_pareidoliaAlgorithm* alg) {
     updateFormantDrift(alg);
 
     // Schedule grains
-    scheduleGrains(alg);
+    scheduleGrains(alg, blockOffsetSamples);
 
 }
 
@@ -1213,10 +1270,14 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     alg->clockPeriodSamples = 0;
     alg->clockSampleCounter = 0;
 
+    alg->smoothedOverlapComp = 1.0f;
+    alg->smoothedInputGain = 0.95f;
+    alg->smoothedDryWet = 0.55f;
+
     alg->formantCVVolts = 0.0f;
     alg->effFormantCenter = 0.45f;
     alg->effDensity = 0.35f;
-    alg->effInputGain = lerpf(0.08f, 1.0f, alg->pInputAtten * alg->pInputAtten);
+    alg->effInputGain = lerpf(1.0f, 0.10f, alg->pInputAtten * alg->pInputAtten);
     alg->effDryWet = 0.55f;
 
     // Initialize DTC data
@@ -1378,12 +1439,23 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         alg->captureWritePos = (alg->captureWritePos + 1) & (kCaptureBufferSize - 1);
     }
 
-    // Control rate processing
-    dtc->controlCounter += numFrames;
-    while (dtc->controlCounter >= kControlRateDiv) {
-        dtc->controlCounter -= kControlRateDiv;
-        updateControlRate(alg);
+    // Control-rate processing with exact intra-block tick offsets.
+    // This avoids scheduling multiple control ticks as if they occurred at block start.
+    int controlCounter = dtc->controlCounter;
+    int sampleOffset = 0;
+    int samplesRemaining = numFrames;
+    while (samplesRemaining > 0) {
+        int toNextTick = kControlRateDiv - controlCounter;
+        if (toNextTick > samplesRemaining) {
+            controlCounter += samplesRemaining;
+            break;
+        }
+        sampleOffset += toNextTick;
+        samplesRemaining -= toNextTick;
+        controlCounter = 0;
+        updateControlRate(alg, sampleOffset);
     }
+    dtc->controlCounter = controlCounter;
 
     // ---- Grain synthesis (overlap-add) ----
     // Use full-size buffers so spectral distortion runs once, not per-chunk
@@ -1394,34 +1466,59 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         grainBufR[i] = 0.0f;
     }
 
-    int activeCount = 0;
+    int voiceCount[128];
+    for (int i = 0; i < numFrames; ++i) {
+        voiceCount[i] = 0;
+    }
+
     for (int g = 0; g < kMaxGrains; ++g) {
         Grain& grain = alg->grains[g];
         if (!grain.active) continue;
 
         float* dst = (grain.channel == 0) ? grainBufL : grainBufR;
-        int remaining = grain.duration - grain.position;
-        if (remaining > numFrames) remaining = numFrames;
+        int frame = 0;
+        while (frame < numFrames && grain.active) {
+            if (grain.startDelay > 0) {
+                int skip = grain.startDelay;
+                int left = numFrames - frame;
+                if (skip > left) skip = left;
+                grain.startDelay -= skip;
+                frame += skip;
+                continue;
+            }
 
-        for (int i = 0; i < remaining; ++i) {
-            dst[i] += processGrainSample(alg, grain);
+            if (grain.position >= grain.duration) {
+                grain.active = false;
+                break;
+            }
+
+            dst[frame] += processGrainSample(alg, grain);
+            voiceCount[frame]++;
             grain.position++;
+            frame++;
         }
 
         if (grain.position >= grain.duration) {
             grain.active = false;
-        } else {
-            activeCount++;
         }
     }
 
-    // Compensate overlap gain, but keep it gentle to avoid sounding squashed.
-    int overlapVoices = activeCount - 3;
-    if (overlapVoices < 0) overlapVoices = 0;
-    float overlapComp = 1.0f / sqrtf(1.0f + 0.18f * (float)overlapVoices);
+    int activeCount = 0;
+    for (int g = 0; g < kMaxGrains; ++g) {
+        if (alg->grains[g].active) activeCount++;
+    }
+
+    // Per-sample smoothing for input gain and overlap compensation to avoid clicks.
+    float smoothCoeff = 1.0f - exp(-1.0f / (kGainSmoothingTimeSec * gSampleRate));
     for (int i = 0; i < numFrames; ++i) {
-        grainBufL[i] *= overlapComp;
-        grainBufR[i] *= overlapComp;
+        int overlapVoices = voiceCount[i] - 3;
+        if (overlapVoices < 0) overlapVoices = 0;
+        float targetOverlapComp = 1.0f / sqrt(1.0f + 0.20f * (float)overlapVoices);
+        alg->smoothedOverlapComp += (targetOverlapComp - alg->smoothedOverlapComp) * smoothCoeff;
+        alg->smoothedInputGain += (alg->effInputGain - alg->smoothedInputGain) * smoothCoeff;
+        float gain = alg->smoothedOverlapComp * alg->smoothedInputGain;
+        grainBufL[i] *= gain;
+        grainBufR[i] *= gain;
     }
 
     // Leave headroom before spectral processing; avoid early saturation.
@@ -1434,31 +1531,37 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
     // ---- Output gain + soft output ceiling ----
     for (int i = 0; i < numFrames; ++i) {
-        grainBufL[i] *= 5.0f;
-        grainBufR[i] *= 5.0f;
+        grainBufL[i] *= 2.0f;
+        grainBufR[i] *= 2.0f;
         // Soft-limit near ±5V so transients are preserved and hard squashing is reduced.
         grainBufL[i] = softClipScaled(grainBufL[i], kOutputSoftCeilingVolts);
         grainBufR[i] = softClipScaled(grainBufR[i], kOutputSoftCeilingVolts);
     }
 
-    // ---- Dry/Wet Mix ----
-    float dryWet = clampf(alg->effDryWet, 0.0f, 1.0f);
-    if (dryWet < 1.0e-5f) dryWet = 0.0f;
-    float dry = 1.0f - dryWet;
+    // ---- Dry/Wet Mix (per-sample smoothed to avoid clicks) ----
+    float targetDryWet = clampf(alg->effDryWet, 0.0f, 1.0f);
     bool outSameAsInL = (outBusL == inBusL);
     bool outSameAsInR = (outBusR == inBusR);
+    // Reuse same smoothing coefficient for dry/wet.
+    float dwSmoothCoeff = smoothCoeff;
     if (replace) {
         for (int i = 0; i < numFrames; ++i) {
-            outL[i] = dry * inL[i] + dryWet * grainBufL[i];
-            outR[i] = dry * inR[i] + dryWet * grainBufR[i];
+            alg->smoothedDryWet += (targetDryWet - alg->smoothedDryWet) * dwSmoothCoeff;
+            float wet = alg->smoothedDryWet;
+            float dry = 1.0f - wet;
+            outL[i] = dry * inL[i] + wet * grainBufL[i];
+            outR[i] = dry * inR[i] + wet * grainBufR[i];
         }
     } else {
         for (int i = 0; i < numFrames; ++i) {
-            float mixedL = dry * inL[i] + dryWet * grainBufL[i];
-            float mixedR = dry * inR[i] + dryWet * grainBufR[i];
+            alg->smoothedDryWet += (targetDryWet - alg->smoothedDryWet) * dwSmoothCoeff;
+            float wet = alg->smoothedDryWet;
+            float dry = 1.0f - wet;
+            float mixedL = dry * inL[i] + wet * grainBufL[i];
+            float mixedR = dry * inR[i] + wet * grainBufR[i];
             // In add mode, avoid doubling dry signal when input/output share a bus.
-            outL[i] += outSameAsInL ? (dryWet * grainBufL[i]) : mixedL;
-            outR[i] += outSameAsInR ? (dryWet * grainBufR[i]) : mixedR;
+            outL[i] += outSameAsInL ? (wet * grainBufL[i]) : mixedL;
+            outR[i] += outSameAsInR ? (wet * grainBufR[i]) : mixedR;
         }
     }
 
