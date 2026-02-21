@@ -206,6 +206,10 @@ static inline float lerpf(float a, float b, float t) {
     return a + (b - a) * t;
 }
 
+static inline float dbToLinear(float db) {
+    return exp(db * 0.11512925465f);  // ln(10) / 20
+}
+
 // Soft clipper (tanh approximation)
 static inline float softClip(float x) {
     if (x > 1.5f) return 1.0f;
@@ -376,7 +380,7 @@ struct _pareidoliaAlgorithm : public _NT_algorithm {
     OnePole smoothGrainLength;
     OnePole smoothFormantCenter;
     OnePole smoothFormantDrift;
-    OnePole smoothInputAtten;
+    OnePole smoothInputGainDb;
     OnePole smoothDryWet;
     OnePole smoothCoherence;
     OnePole smoothInputTracking;
@@ -395,7 +399,7 @@ struct _pareidoliaAlgorithm : public _NT_algorithm {
     float pGrainLength;
     float pFormantCenter;
     float pFormantDrift;
-    float pInputAtten;
+    float pInputGainDb;
     float pDryWet;
     float pCoherence;
     float pInputTracking;
@@ -423,6 +427,10 @@ struct _pareidoliaAlgorithm : public _NT_algorithm {
     float smoothedInputGain;
     float smoothedDryWet;
 
+    // Soft takeover state for custom UI pots
+    float lastPotPos[3];   // previous physical pot position for delta calc
+    float potTarget[3];    // virtual pot position (0-1, soft takeover target)
+
     // --- DRAM pointers ---
     // Input capture buffer for Mode B (4096 × 2ch)
     float* captureBuffer;    // [kCaptureBufferSize * 2] interleaved L/R
@@ -444,7 +452,7 @@ enum {
     kParamGrainLength,
     kParamFormantCenter,
     kParamFormantDrift,
-    kParamInputAtten,
+    kParamInputGain,
     kParamDryWetMix,
     kParamCoherence,
     kParamInputTracking,
@@ -479,7 +487,7 @@ static const _NT_parameter parameters[] = {
     { .name = "Grain Length",   .min = 0, .max = 100, .def = 25, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
     { .name = "Formant Center", .min = 0, .max = 100, .def = 45, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
     { .name = "Formant Drift",  .min = 0, .max = 100, .def = 35, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
-    { .name = "Input Atten",    .min = 0, .max = 100, .def = 25, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
+    { .name = "Input Gain",     .min = -70, .max = 24, .def = 0, .unit = kNT_unitDb,       .scaling = 0, .enumStrings = NULL },
     { .name = "Dry/Wet Mix",    .min = 0, .max = 100, .def = 55, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
     { .name = "Coherence",      .min = 0, .max = 100, .def = 60, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
     { .name = "Input Tracking", .min = 0, .max = 100, .def = 70, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
@@ -493,7 +501,7 @@ static const _NT_parameter parameters[] = {
 static const uint8_t pageMain[] = {
     kParamGrainSource, kParamGrainDensity, kParamGrainLength,
     kParamFormantCenter, kParamFormantDrift,
-    kParamInputAtten, kParamDryWetMix, kParamCoherence, kParamInputTracking,
+    kParamInputGain, kParamDryWetMix, kParamCoherence, kParamInputTracking,
     kParamPitchTrackEnable, kParamFreeze,
 };
 
@@ -1104,7 +1112,7 @@ static void updateControlRate(_pareidoliaAlgorithm* alg, int blockOffsetSamples)
     float rawGrainLength   = (float)alg->v[kParamGrainLength] / 100.0f;
     float rawFormantCenter = (float)alg->v[kParamFormantCenter] / 100.0f;
     float rawFormantDrift  = (float)alg->v[kParamFormantDrift] / 100.0f;
-    float rawInputAtten    = (float)alg->v[kParamInputAtten] / 100.0f;
+    float rawInputGainDb   = (float)alg->v[kParamInputGain];
     float rawDryWet        = (float)alg->v[kParamDryWetMix] / 100.0f;
     float rawCoherence     = (float)alg->v[kParamCoherence] / 100.0f;
     float rawTracking      = (float)alg->v[kParamInputTracking] / 100.0f;
@@ -1113,7 +1121,7 @@ static void updateControlRate(_pareidoliaAlgorithm* alg, int blockOffsetSamples)
     alg->pGrainLength    = alg->smoothGrainLength.process(rawGrainLength);
     alg->pFormantCenter  = alg->smoothFormantCenter.process(rawFormantCenter);
     alg->pFormantDrift   = alg->smoothFormantDrift.process(rawFormantDrift);
-    alg->pInputAtten     = alg->smoothInputAtten.process(rawInputAtten);
+    alg->pInputGainDb    = alg->smoothInputGainDb.process(rawInputGainDb);
     if (rawDryWet <= 0.0001f) {
         alg->smoothDryWet.set(0.0f);
         alg->pDryWet = 0.0f;
@@ -1126,10 +1134,8 @@ static void updateControlRate(_pareidoliaAlgorithm* alg, int blockOffsetSamples)
     // Pitch tracking toggle smoother
     alg->pPitchTrackEnable = alg->smoothPitchTrackEnable.process((float)alg->v[kParamPitchTrackEnable]);
 
-    // Input attenuation: 0% = unity, 100% = heavy attenuation.
-    // Knob is squared for finer low-attenuation control.
-    float attenShape = alg->pInputAtten * alg->pInputAtten;
-    alg->effInputGain = lerpf(1.0f, 0.10f, attenShape);
+    // Input gain (dB): -70 dB to +24 dB.
+    alg->effInputGain = dbToLinear(alg->pInputGainDb);
 
     // Hold last valid pitch estimate (only when pitch tracking is active)
     if (alg->pPitchTrackEnable > 0.01f) {
@@ -1256,7 +1262,7 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     alg->smoothGrainLength.init(0.25f, 8.0f);
     alg->smoothFormantCenter.init(0.45f, 10.0f);
     alg->smoothFormantDrift.init(0.35f, 9.0f);
-    alg->smoothInputAtten.init(0.25f, 7.0f);
+    alg->smoothInputGainDb.init(0.0f, 7.0f);
     alg->smoothDryWet.init(0.55f, 6.0f);
     alg->smoothCoherence.init(0.60f, 9.0f);
     alg->smoothInputTracking.init(0.70f, 9.0f);
@@ -1274,7 +1280,7 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     alg->pGrainLength = 0.25f;
     alg->pFormantCenter = 0.45f;
     alg->pFormantDrift = 0.35f;
-    alg->pInputAtten = 0.25f;
+    alg->pInputGainDb = 0.0f;
     alg->pDryWet = 0.55f;
     alg->pCoherence = 0.60f;
     alg->pInputTracking = 0.70f;
@@ -1288,13 +1294,13 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
     alg->clockSampleCounter = 0;
 
     alg->smoothedOverlapComp = 1.0f;
-    alg->smoothedInputGain = 0.95f;
+    alg->smoothedInputGain = 1.0f;
     alg->smoothedDryWet = 0.55f;
 
     alg->formantCVVolts = 0.0f;
     alg->effFormantCenter = 0.45f;
     alg->effDensity = 0.35f;
-    alg->effInputGain = lerpf(1.0f, 0.10f, alg->pInputAtten * alg->pInputAtten);
+    alg->effInputGain = dbToLinear(alg->pInputGainDb);
     alg->effDryWet = 0.55f;
 
     // Initialize DTC data
@@ -1309,6 +1315,12 @@ static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs,
 
     // Zero capture buffer
     memset(alg->captureBuffer, 0, kCaptureBufferSize * 2 * sizeof(float));
+
+    // Initialize soft takeover state
+    for (int i = 0; i < 3; ++i) {
+        alg->lastPotPos[i] = 0.5f;
+        alg->potTarget[i] = 0.5f;
+    }
 
     return alg;
 }
@@ -1576,56 +1588,158 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
 static bool draw(_NT_algorithm* self) {
     _pareidoliaAlgorithm* alg = (_pareidoliaAlgorithm*)self;
-
-    // Draw a simple visualization
-    // Show active grain count as a bar
     int activeCount = alg->dtc->activeGrainCount;
 
-    // Title
-    NT_drawText(128, 16, "PAREIDOLIA", 15, kNT_textCentre, kNT_textNormal);
+    // Row 1: Title (dimmer, centered)
+    NT_drawText(128, 2, "PAREIDOLIA", 10, kNT_textCentre, kNT_textNormal);
 
-    // Active grains indicator
-    char buf[32];
-    NT_intToString(buf, activeCount);
-    NT_drawText(10, 30, "Grains:", 10, kNT_textLeft, kNT_textTiny);
-    NT_drawText(50, 30, buf, 15, kNT_textLeft, kNT_textTiny);
-
-    // Grain bar
-    int barWidth = (activeCount * 200) / kMaxGrains;
-    if (barWidth > 0) {
-        NT_drawShapeI(kNT_rectangle, 10, 35, 10 + barWidth, 40, 12);
-    }
-
-    // Formant info
-    char f1Buf[16], f2Buf[16];
-    NT_intToString(f1Buf, (int)alg->f1Final);
-    NT_intToString(f2Buf, (int)alg->f2Final);
-    NT_drawText(10, 45, "F1:", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(30, 45, f1Buf, 12, kNT_textLeft, kNT_textTiny);
-    NT_drawText(70, 45, "F2:", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(90, 45, f2Buf, 12, kNT_textLeft, kNT_textTiny);
-
-    // Pitch info
-    if (alg->pitchConfidence > 0.5f) {
-        char pitchBuf[16];
-        NT_intToString(pitchBuf, (int)alg->pitchEstimate);
-        NT_drawText(140, 45, "P:", 8, kNT_textLeft, kNT_textTiny);
-        NT_drawText(155, 45, pitchBuf, 12, kNT_textLeft, kNT_textTiny);
-    }
-
-    // Mode indicator
+    // Row 2: Mode, Freeze, Mix
     const char* modeStr = "?";
     switch (alg->v[kParamGrainSource]) {
         case 0: modeStr = "NOISE"; break;
         case 1: modeStr = "INPUT"; break;
-        case 2: modeStr = "RESO"; break;
+        case 2: modeStr = "RESONATOR"; break;
     }
-    NT_drawText(200, 30, modeStr, 15, kNT_textLeft, kNT_textTiny);
+    NT_drawText(10, 16, modeStr, 15, kNT_textLeft, kNT_textTiny);
+
     if (alg->v[kParamFreeze]) {
-        NT_drawText(200, 42, "FRZ", 14, kNT_textLeft, kNT_textTiny);
+        NT_drawText(128, 16, "FREEZE", 15, kNT_textCentre, kNT_textTiny);
     }
 
-    return false;
+    char mixBuf[16];
+    NT_intToString(mixBuf, alg->v[kParamDryWetMix]);
+    NT_drawText(210, 16, "Mix:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(232, 16, mixBuf, 12, kNT_textLeft, kNT_textTiny);
+
+    // Row 3: Grain count + bar
+    char grainBuf[16];
+    NT_intToString(grainBuf, activeCount);
+    NT_drawText(10, 32, "Grains:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(50, 32, grainBuf, 12, kNT_textLeft, kNT_textTiny);
+
+    // Grain bar: dim background + bright fill
+    int barX = 75;
+    int barW = 170;
+    NT_drawShapeI(kNT_rectangle, barX, 32, barX + barW, 38, 3);
+    int fillW = (activeCount * barW) / kMaxGrains;
+    if (fillW > barW) fillW = barW;
+    if (fillW > 0) {
+        NT_drawShapeI(kNT_rectangle, barX, 32, barX + fillW, 38, 13);
+    }
+
+    // Row 4: Formant + pitch info
+    char f1Buf[16], f2Buf[16], pitchBuf[16];
+    NT_intToString(f1Buf, (int)alg->f1Final);
+    NT_intToString(f2Buf, (int)alg->f2Final);
+    NT_drawText(10, 43, "F1:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(28, 43, f1Buf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(80, 43, "F2:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(98, 43, f2Buf, 12, kNT_textLeft, kNT_textTiny);
+    if (alg->pitchConfidence > 0.5f) {
+        NT_intToString(pitchBuf, (int)alg->pitchEstimate);
+        NT_drawText(160, 43, "P:", 8, kNT_textLeft, kNT_textTiny);
+        NT_drawText(173, 43, pitchBuf, 12, kNT_textLeft, kNT_textTiny);
+    }
+
+    // Row 5: Pot-mapped parameters (soft takeover feedback)
+    char denBuf[16], lenBuf[16], fmtBuf[16];
+    NT_intToString(denBuf, alg->v[kParamGrainDensity]);
+    NT_intToString(lenBuf, alg->v[kParamGrainLength]);
+    NT_intToString(fmtBuf, alg->v[kParamFormantCenter]);
+    NT_drawText(10, 55, "Den:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(32, 55, denBuf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(85, 55, "Len:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(107, 55, lenBuf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(165, 55, "Fmt:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(187, 55, fmtBuf, 12, kNT_textLeft, kNT_textTiny);
+
+    return true;  // hide standard parameter footer
+}
+
+// ============================================================================
+// Custom UI
+// ============================================================================
+
+static uint32_t hasCustomUi(_NT_algorithm* self) {
+    (void)self;
+    return kNT_potL | kNT_potC | kNT_potR |
+           kNT_encoderL | kNT_encoderR | kNT_encoderButtonL;
+}
+
+static void customUi(_NT_algorithm* self, const _NT_uiData& data) {
+    _pareidoliaAlgorithm* alg = (_pareidoliaAlgorithm*)self;
+    int algIndex = NT_algorithmIndex(self);
+    int offset = NT_parameterOffset();
+
+    // --- Pots: soft takeover (delta-based) ---
+    const int potParams[3] = { kParamGrainDensity, kParamGrainLength, kParamFormantCenter };
+    const uint16_t potFlags[3] = { kNT_potL, kNT_potC, kNT_potR };
+
+    for (int pot = 0; pot < 3; pot++) {
+        bool potMoved = (data.controls & potFlags[pot]) != 0;
+        if (!potMoved) continue;
+
+        float potPos = data.pots[pot];
+        float delta = potPos - alg->lastPotPos[pot];
+
+        float* target = &alg->potTarget[pot];
+        *target += delta;
+        if (*target < 0.0f) *target = 0.0f;
+        if (*target > 1.0f) *target = 1.0f;
+
+        // Sync when pot catches target (±2%) or hits endpoints
+        bool inSync = (potPos - *target > -0.02f && potPos - *target < 0.02f) ||
+                      potPos <= 0.01f || potPos >= 0.99f;
+        if (inSync) {
+            *target = potPos;
+        }
+
+        int value = (int)(*target * 100.0f);
+        if (value < 0) value = 0;
+        if (value > 100) value = 100;
+        NT_setParameterFromUi(algIndex, potParams[pot] + offset, value);
+
+        alg->lastPotPos[pot] = potPos;
+    }
+
+    // --- Encoder L turn: Dry/Wet Mix ±2 per click ---
+    if (data.encoders[0] != 0) {
+        int current = alg->v[kParamDryWetMix];
+        int newVal = current + data.encoders[0] * 2;
+        if (newVal < 0) newVal = 0;
+        if (newVal > 100) newVal = 100;
+        NT_setParameterFromUi(algIndex, kParamDryWetMix + offset, newVal);
+    }
+
+    // --- Encoder L press: Freeze toggle (rising edge) ---
+    if ((data.controls & kNT_encoderButtonL) && !(data.lastButtons & kNT_encoderButtonL)) {
+        int current = alg->v[kParamFreeze];
+        NT_setParameterFromUi(algIndex, kParamFreeze + offset, current ? 0 : 1);
+    }
+
+    // --- Encoder R turn: Grain Source ±1, clamped 0-2 ---
+    if (data.encoders[1] != 0) {
+        int current = alg->v[kParamGrainSource];
+        int newVal = current + data.encoders[1];
+        if (newVal < 0) newVal = 0;
+        if (newVal > 2) newVal = 2;
+        NT_setParameterFromUi(algIndex, kParamGrainSource + offset, newVal);
+    }
+}
+
+static void setupUi(_NT_algorithm* self, _NT_float3& pots) {
+    _pareidoliaAlgorithm* alg = (_pareidoliaAlgorithm*)self;
+
+    // Initialize pot positions from current parameter values
+    pots[0] = alg->v[kParamGrainDensity] / 100.0f;
+    pots[1] = alg->v[kParamGrainLength] / 100.0f;
+    pots[2] = alg->v[kParamFormantCenter] / 100.0f;
+
+    // Sync soft takeover targets
+    for (int i = 0; i < 3; ++i) {
+        alg->lastPotPos[i] = pots[i];
+        alg->potTarget[i] = pots[i];
+    }
 }
 
 // ============================================================================
@@ -1648,9 +1762,9 @@ static const _NT_factory factory = {
     .midiRealtime = NULL,
     .midiMessage = NULL,
     .tags = kNT_tagEffect,
-    .hasCustomUi = NULL,
-    .customUi = NULL,
-    .setupUi = NULL,
+    .hasCustomUi = hasCustomUi,
+    .customUi = customUi,
+    .setupUi = setupUi,
     .serialise = NULL,
     .deserialise = NULL,
     .midiSysEx = NULL,
