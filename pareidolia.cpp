@@ -449,6 +449,7 @@ enum {
     kParamInputTracking,
     kParamFormantCV,
     kParamPitchTrackEnable,
+    kParamFreeze,
     kParamClockCV,
     kNumParams,
 };
@@ -483,6 +484,7 @@ static const _NT_parameter parameters[] = {
     { .name = "Input Tracking", .min = 0, .max = 100, .def = 70, .unit = kNT_unitPercent,  .scaling = 0, .enumStrings = NULL },
     NT_PARAMETER_CV_INPUT("Formant CV", 0, 0)
     { .name = "Pitch Track",   .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = onOffStrings },
+    { .name = "Freeze",   .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = onOffStrings },
     NT_PARAMETER_CV_INPUT("Clock", 0, 0)
 };
 
@@ -491,7 +493,7 @@ static const uint8_t pageMain[] = {
     kParamGrainSource, kParamGrainDensity, kParamGrainLength,
     kParamFormantCenter, kParamFormantDrift,
     kParamInputAtten, kParamDryWetMix, kParamCoherence, kParamInputTracking,
-    kParamPitchTrackEnable,
+    kParamPitchTrackEnable, kParamFreeze,
 };
 
 static const uint8_t pageRouting[] = {
@@ -1321,6 +1323,7 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     int outBusL = alg->v[kParamOutputL] - 1;
     int outBusR = alg->v[kParamOutputR] - 1;
     bool replace = alg->v[kParamOutputMode];
+    bool freeze = (alg->v[kParamFreeze] != 0);
 
     const float* inL = busFrames + inBusL * numFrames;
     const float* inR = busFrames + inBusR * numFrames;
@@ -1389,8 +1392,15 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
     }
 
-    // YIN pitch tracking (expensive — gated by toggle)
-    if (alg->pPitchTrackEnable > 0.01f) {
+    // Analysis path (disabled while frozen)
+    if (freeze) {
+        // Freeze holds last analyzed/captured state and skips analysis CPU work.
+        alg->yinInProgress = false;
+        alg->yinDiffDone = false;
+        alg->spectralInProgress = false;
+        alg->analysisReady = false;
+    } else if (alg->pPitchTrackEnable > 0.01f) {
+        // YIN pitch tracking (expensive — gated by toggle)
         if (alg->analysisReady && !alg->yinInProgress) {
             alg->analysisReady = false;
             yinBegin(alg);  // snapshots the buffer
@@ -1421,22 +1431,24 @@ static void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         spectralFeaturesStep(alg);
     }
 
-    // Accumulate into analysis buffer and capture buffer
-    for (int i = 0; i < numFrames; ++i) {
-        float wetInL = inL[i] * alg->effInputGain;
-        float wetInR = inR[i] * alg->effInputGain;
-        float mono = (wetInL + wetInR) * 0.5f;
-        alg->analysisBuffer[alg->analysisWritePos] = mono;
-        alg->analysisWritePos++;
-        if (alg->analysisWritePos >= kAnalysisBufferSize) {
-            alg->analysisWritePos = 0;
-            alg->analysisReady = true;
-        }
+    // Accumulate into analysis and capture buffers (unless frozen).
+    if (!freeze) {
+        for (int i = 0; i < numFrames; ++i) {
+            float wetInL = inL[i] * alg->effInputGain;
+            float wetInR = inR[i] * alg->effInputGain;
+            float mono = (wetInL + wetInR) * 0.5f;
+            alg->analysisBuffer[alg->analysisWritePos] = mono;
+            alg->analysisWritePos++;
+            if (alg->analysisWritePos >= kAnalysisBufferSize) {
+                alg->analysisWritePos = 0;
+                alg->analysisReady = true;
+            }
 
-        // Capture buffer for Mode B (always needed for input-seeded grains)
-        alg->captureBuffer[alg->captureWritePos] = inL[i];
-        alg->captureBuffer[kCaptureBufferSize + alg->captureWritePos] = inR[i];
-        alg->captureWritePos = (alg->captureWritePos + 1) & (kCaptureBufferSize - 1);
+            // Capture buffer for Mode B
+            alg->captureBuffer[alg->captureWritePos] = inL[i];
+            alg->captureBuffer[kCaptureBufferSize + alg->captureWritePos] = inR[i];
+            alg->captureWritePos = (alg->captureWritePos + 1) & (kCaptureBufferSize - 1);
+        }
     }
 
     // Control-rate processing with exact intra-block tick offsets.
@@ -1619,6 +1631,9 @@ static bool draw(_NT_algorithm* self) {
         case 2: modeStr = "RESO"; break;
     }
     NT_drawText(200, 30, modeStr, 15, kNT_textLeft, kNT_textTiny);
+    if (alg->v[kParamFreeze]) {
+        NT_drawText(200, 42, "FRZ", 14, kNT_textLeft, kNT_textTiny);
+    }
 
     return false;
 }
