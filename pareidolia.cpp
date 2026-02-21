@@ -1590,68 +1590,71 @@ static bool draw(_NT_algorithm* self) {
     _pareidoliaAlgorithm* alg = (_pareidoliaAlgorithm*)self;
     int activeCount = alg->dtc->activeGrainCount;
 
-    // Row 1: Title (dimmer, centered)
-    NT_drawText(128, 2, "PAREIDOLIA", 10, kNT_textCentre, kNT_textNormal);
+    // y values are baselines (bottom of text).
+    // kNT_textNormal ~8px tall, kNT_textTiny ~5px tall.
 
-    // Row 2: Mode, Freeze, Mix
+    // Row 1: Title (baseline y=10, text spans ~2-10)
+    NT_drawText(128, 10, "PAREIDOLIA", 10, kNT_textCentre, kNT_textNormal);
+
+    // Row 2: Mode, Freeze, Mix (baseline y=22, text spans ~17-22)
     const char* modeStr = "?";
     switch (alg->v[kParamGrainSource]) {
         case 0: modeStr = "NOISE"; break;
         case 1: modeStr = "INPUT"; break;
         case 2: modeStr = "RESONATOR"; break;
     }
-    NT_drawText(10, 16, modeStr, 15, kNT_textLeft, kNT_textTiny);
+    NT_drawText(10, 22, modeStr, 15, kNT_textLeft, kNT_textTiny);
 
     if (alg->v[kParamFreeze]) {
-        NT_drawText(128, 16, "FREEZE", 15, kNT_textCentre, kNT_textTiny);
+        NT_drawText(128, 22, "FREEZE", 15, kNT_textCentre, kNT_textTiny);
     }
 
     char mixBuf[16];
     NT_intToString(mixBuf, alg->v[kParamDryWetMix]);
-    NT_drawText(210, 16, "Mix:", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(232, 16, mixBuf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(210, 22, "Mix:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(232, 22, mixBuf, 12, kNT_textLeft, kNT_textTiny);
 
-    // Row 3: Grain count + bar
+    // Row 3: Grain count + bar (baseline y=34, text spans ~29-34)
     char grainBuf[16];
     NT_intToString(grainBuf, activeCount);
-    NT_drawText(10, 32, "Grains:", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(50, 32, grainBuf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(10, 34, "Grains:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(50, 34, grainBuf, 12, kNT_textLeft, kNT_textTiny);
 
-    // Grain bar: dim background + bright fill
+    // Grain bar: aligned with text row (y=29 to y=34)
     int barX = 75;
     int barW = 170;
-    NT_drawShapeI(kNT_rectangle, barX, 32, barX + barW, 38, 3);
+    NT_drawShapeI(kNT_rectangle, barX, 29, barX + barW, 35, 3);
     int fillW = (activeCount * barW) / kMaxGrains;
     if (fillW > barW) fillW = barW;
     if (fillW > 0) {
-        NT_drawShapeI(kNT_rectangle, barX, 32, barX + fillW, 38, 13);
+        NT_drawShapeI(kNT_rectangle, barX, 29, barX + fillW, 35, 13);
     }
 
-    // Row 4: Formant + pitch info
+    // Row 4: Formant + pitch info (baseline y=46, text spans ~41-46)
     char f1Buf[16], f2Buf[16], pitchBuf[16];
     NT_intToString(f1Buf, (int)alg->f1Final);
     NT_intToString(f2Buf, (int)alg->f2Final);
-    NT_drawText(10, 43, "F1:", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(28, 43, f1Buf, 12, kNT_textLeft, kNT_textTiny);
-    NT_drawText(80, 43, "F2:", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(98, 43, f2Buf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(10, 46, "F1:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(28, 46, f1Buf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(80, 46, "F2:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(98, 46, f2Buf, 12, kNT_textLeft, kNT_textTiny);
     if (alg->pitchConfidence > 0.5f) {
         NT_intToString(pitchBuf, (int)alg->pitchEstimate);
-        NT_drawText(160, 43, "P:", 8, kNT_textLeft, kNT_textTiny);
-        NT_drawText(173, 43, pitchBuf, 12, kNT_textLeft, kNT_textTiny);
+        NT_drawText(160, 46, "P:", 8, kNT_textLeft, kNT_textTiny);
+        NT_drawText(173, 46, pitchBuf, 12, kNT_textLeft, kNT_textTiny);
     }
 
-    // Row 5: Pot-mapped parameters (soft takeover feedback)
+    // Row 5: Pot-mapped parameters (baseline y=58, text spans ~53-58)
     char denBuf[16], lenBuf[16], fmtBuf[16];
     NT_intToString(denBuf, alg->v[kParamGrainDensity]);
     NT_intToString(lenBuf, alg->v[kParamGrainLength]);
     NT_intToString(fmtBuf, alg->v[kParamFormantCenter]);
-    NT_drawText(10, 55, "Den:", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(32, 55, denBuf, 12, kNT_textLeft, kNT_textTiny);
-    NT_drawText(85, 55, "Len:", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(107, 55, lenBuf, 12, kNT_textLeft, kNT_textTiny);
-    NT_drawText(165, 55, "Fmt:", 8, kNT_textLeft, kNT_textTiny);
-    NT_drawText(187, 55, fmtBuf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(10, 58, "Den:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(32, 58, denBuf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(85, 58, "Len:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(107, 58, lenBuf, 12, kNT_textLeft, kNT_textTiny);
+    NT_drawText(165, 58, "Fmt:", 8, kNT_textLeft, kNT_textTiny);
+    NT_drawText(187, 58, fmtBuf, 12, kNT_textLeft, kNT_textTiny);
 
     return true;  // hide standard parameter footer
 }
